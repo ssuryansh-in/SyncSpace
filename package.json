@@ -1,0 +1,10 @@
+{
+  "name": "syncspace",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "pnpm --filter @syncspace/server dev",
+    "build": "pnpm --filter @syncspace/server build",
+    "test": "pnpm --filter @syncspace/server test"
+  }
+}
