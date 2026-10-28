@@ -8,6 +8,8 @@ describe("Environment Configuration (loadEnv)", () => {
     expect(config.NODE_ENV).toBe("development");
     expect(config.PORT).toBe(4000);
     expect(config.HOST).toBe("127.0.0.1");
+    expect(config.DB_POOL_MAX).toBe(10);
+    expect(config.DATABASE_URL).toBeUndefined();
   });
 
   it("parses valid custom values correctly", () => {
@@ -15,11 +17,27 @@ describe("Environment Configuration (loadEnv)", () => {
       NODE_ENV: "production",
       PORT: "8080",
       HOST: "0.0.0.0",
+      DATABASE_URL: "postgres://user:password@localhost:5432/syncspace",
+      DB_POOL_MAX: "25",
     });
 
     expect(config.NODE_ENV).toBe("production");
     expect(config.PORT).toBe(8080);
     expect(config.HOST).toBe("0.0.0.0");
+    expect(config.DATABASE_URL).toBe(
+      "postgres://user:password@localhost:5432/syncspace"
+    );
+    expect(config.DB_POOL_MAX).toBe(25);
+  });
+
+  it("accepts postgresql:// protocol alias", () => {
+    const config = loadEnv({
+      DATABASE_URL: "postgresql://user:password@localhost:5432/syncspace",
+    });
+
+    expect(config.DATABASE_URL).toBe(
+      "postgresql://user:password@localhost:5432/syncspace"
+    );
   });
 
   it("supports ephemeral port 0 for dynamic test bindings", () => {
@@ -78,6 +96,44 @@ describe("Environment Configuration (loadEnv)", () => {
     ).toThrowError(/HOST cannot be empty/);
   });
 
+  it("rejects malformed DATABASE_URL strings", () => {
+    expect(() =>
+      loadEnv({
+        DATABASE_URL: "not-a-valid-url",
+      })
+    ).toThrowError(/DATABASE_URL must be a valid URL/);
+  });
+
+  it("rejects unsupported protocols in DATABASE_URL", () => {
+    expect(() =>
+      loadEnv({
+        DATABASE_URL: "mysql://user:pass@localhost:3306/db",
+      })
+    ).toThrowError(/DATABASE_URL must use postgres:\/\/ or postgresql:\/\/ protocol/);
+  });
+
+  it("requires DATABASE_URL when NODE_ENV is production", () => {
+    expect(() =>
+      loadEnv({
+        NODE_ENV: "production",
+      })
+    ).toThrowError(/DATABASE_URL is required in production/);
+  });
+
+  it("rejects invalid DB_POOL_MAX values (< 1 or > 100)", () => {
+    expect(() =>
+      loadEnv({
+        DB_POOL_MAX: "0",
+      })
+    ).toThrowError(/DB_POOL_MAX must be at least 1/);
+
+    expect(() =>
+      loadEnv({
+        DB_POOL_MAX: "150",
+      })
+    ).toThrowError(/DB_POOL_MAX cannot exceed 100/);
+  });
+
   it("formats error messages safely without printing raw secret values", () => {
     const sensitiveValue = "SUPER_SECRET_TOKEN_DO_NOT_LEAK";
 
@@ -94,5 +150,21 @@ describe("Environment Configuration (loadEnv)", () => {
       expect(message).not.toContain(sensitiveValue);
     }
   });
-});
 
+  it("does not leak credentials in DATABASE_URL validation errors", () => {
+    const secretPassword = "SuperConfidentialPassword123!";
+    const invalidUrlWithPassword = `mysql://admin:${secretPassword}@db.example.com:5432/syncspace`;
+
+    try {
+      loadEnv({
+        DATABASE_URL: invalidUrlWithPassword,
+      });
+      expect.unreachable("Should have thrown validation error");
+    } catch (err: unknown) {
+      expect(err).toBeInstanceOf(Error);
+      const message = (err as Error).message;
+      expect(message).toContain("DATABASE_URL");
+      expect(message).not.toContain(secretPassword);
+    }
+  });
+});

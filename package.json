@@ -5,6 +5,8 @@
   "scripts": {
     "dev": "pnpm --filter @syncspace/server dev",
     "build": "pnpm --filter @syncspace/server build",
-    "test": "pnpm --filter @syncspace/server test"
+    "test": "pnpm --filter @syncspace/server test",
+    "test:unit": "pnpm --filter @syncspace/server test:unit",
+    "test:integration": "pnpm --filter @syncspace/server test:integration"
   }
 }

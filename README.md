@@ -121,10 +121,18 @@ The system baseline requires passing the following criteria under a documented b
 ### Prerequisites
 - Node.js (v20+ supported; tested on Node.js v26.1.0)
 - pnpm (tested on pnpm v12.3.4)
+- Docker Desktop or PostgreSQL 16 (for database and integration tests)
+
+### Database Setup (Milestone 2)
+- **Start PostgreSQL container:** `docker compose up -d`
+- **Stop PostgreSQL container:** `docker compose down`
+- **Generate migrations:** `pnpm --filter @syncspace/server db:generate`
+- **Apply migrations:** `pnpm --filter @syncspace/server db:migrate`
 
 ### Package & Workspace Commands
 - **Install dependencies:** `pnpm install`
-- **Run automated test suite:** `pnpm test`
+- **Run unit test suite:** `pnpm test` (or `pnpm --filter @syncspace/server test:unit`)
+- **Run database integration tests:** `pnpm --filter @syncspace/server test:integration`
 - **Build TypeScript server:** `pnpm build`
 - **Start development server with live watch:** `pnpm dev`
 - **Start built production server:** `pnpm --filter @syncspace/server start`

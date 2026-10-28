@@ -20,12 +20,14 @@ describe("Application Factory & Health Endpoint (In-Memory HTTP)", () => {
     expect(body).toMatchObject({
       status: "ok",
       uptime: expect.any(Number),
+      eventLoopLatencyMs: expect.any(Number),
       timestamp: expect.any(String),
     });
 
     // Verify timestamp is a valid ISO 8601 string
     expect(new Date(body.timestamp).toISOString()).toBe(body.timestamp);
     expect(body.uptime).toBeGreaterThanOrEqual(0);
+    expect(body.eventLoopLatencyMs).toBeGreaterThanOrEqual(0);
   });
 
   it("returns standardized JSON 404 for unknown routes", async () => {

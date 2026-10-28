@@ -1,33 +1,68 @@
 import { z } from "zod";
 
-const envSchema = z.object({
-  NODE_ENV: z
-    .enum(["development", "production", "test"], {
-      errorMap: () => ({
-        message: "NODE_ENV must be one of: development, production, test",
-      }),
-    })
-    .default("development"),
-  PORT: z
-    .preprocess((val) => {
-      if (val === undefined || val === null || val === "") {
-        return 4000;
-      }
-      if (typeof val === "string") {
-        const parsed = Number(val);
-        return Number.isNaN(parsed) ? val : parsed;
-      }
-      return val;
-    }, z.number({ invalid_type_error: "PORT must be a valid number" })
-      .int("PORT must be an integer")
-      .min(0, "PORT must be between 0 and 65535")
-      .max(65535, "PORT must be between 0 and 65535"))
-    .default(4000),
-  HOST: z
-    .string({ invalid_type_error: "HOST must be a string" })
-    .min(1, "HOST cannot be empty")
-    .default("127.0.0.1"),
-});
+const envSchema = z
+  .object({
+    NODE_ENV: z
+      .enum(["development", "production", "test"], {
+        errorMap: () => ({
+          message: "NODE_ENV must be one of: development, production, test",
+        }),
+      })
+      .default("development"),
+    PORT: z
+      .preprocess((val) => {
+        if (val === undefined || val === null || val === "") {
+          return 4000;
+        }
+        if (typeof val === "string") {
+          const parsed = Number(val);
+          return Number.isNaN(parsed) ? val : parsed;
+        }
+        return val;
+      }, z.number({ invalid_type_error: "PORT must be a valid number" })
+        .int("PORT must be an integer")
+        .min(0, "PORT must be between 0 and 65535")
+        .max(65535, "PORT must be between 0 and 65535"))
+      .default(4000),
+    HOST: z
+      .string({ invalid_type_error: "HOST must be a string" })
+      .min(1, "HOST cannot be empty")
+      .default("127.0.0.1"),
+    DATABASE_URL: z
+      .string({ invalid_type_error: "DATABASE_URL must be a string" })
+      .url("DATABASE_URL must be a valid URL")
+      .refine(
+        (val) =>
+          val.startsWith("postgres://") || val.startsWith("postgresql://"),
+        {
+          message:
+            "DATABASE_URL must use postgres:// or postgresql:// protocol",
+        }
+      )
+      .optional(),
+    DB_POOL_MAX: z
+      .preprocess((val) => {
+        if (val === undefined || val === null || val === "") return 10;
+        if (typeof val === "string") {
+          const parsed = Number(val);
+          return Number.isNaN(parsed) ? val : parsed;
+        }
+        return val;
+      }, z.number({ invalid_type_error: "DB_POOL_MAX must be a valid number" })
+        .int("DB_POOL_MAX must be an integer")
+        .min(1, "DB_POOL_MAX must be at least 1")
+        .max(100, "DB_POOL_MAX cannot exceed 100"))
+      .default(10),
+  })
+  .superRefine((data, ctx) => {
+    if (data.NODE_ENV === "production" && !data.DATABASE_URL) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["DATABASE_URL"],
+        message: "DATABASE_URL is required in production",
+      });
+    }
+  });
 
 export type EnvConfig = z.infer<typeof envSchema>;
 
@@ -65,4 +100,3 @@ export function loadEnv(
 
   return result.data;
 }
-

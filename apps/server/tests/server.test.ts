@@ -84,7 +84,13 @@ describe("HTTP Server Lifecycle & Graceful Shutdown", () => {
       },
     });
 
+    let onHit: () => void;
+    const hitPromise = new Promise<void>((resolve) => {
+      onHit = resolve;
+    });
+
     testApp.get("/hang", async () => {
+      onHit();
       // Simulate an unyielding operation lasting 2,000ms
       await new Promise((resolve) => setTimeout(resolve, 2000));
       return new Response("finished");
@@ -109,8 +115,8 @@ describe("HTTP Server Lifecycle & Graceful Shutdown", () => {
       }
     );
 
-    // Give a brief moment for the TCP connection to establish and request to hit the server
-    await new Promise((resolve) => setTimeout(resolve, 30));
+    // Ensure the request has actually reached the server before initiating stop
+    await hitPromise;
 
     const shutdownStart = Date.now();
     await handle.stop();

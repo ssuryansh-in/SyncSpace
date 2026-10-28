@@ -1,9 +1,12 @@
 import { Hono } from "hono";
 import { healthRoute } from "./routes/health.js";
+import { createReadyRoute } from "./routes/ready.js";
 import type { EnvConfig } from "./config/env.js";
 
 export interface AppOptions {
   config?: EnvConfig;
+  checkDb?: () => Promise<{ ok: boolean; error?: string }>;
+  isShuttingDown?: () => boolean;
 }
 
 /**
@@ -46,6 +49,13 @@ export function createApp(options: AppOptions = {}): Hono {
 
   // Mount routes
   app.route("/health", healthRoute);
+  app.route(
+    "/ready",
+    createReadyRoute({
+      checkDb: options.checkDb,
+      isShuttingDown: options.isShuttingDown,
+    })
+  );
 
   return app;
 }

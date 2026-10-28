@@ -5,6 +5,7 @@ import path from "node:path";
 import type { Hono } from "hono";
 import { createApp } from "./app.js";
 import { loadEnv, type EnvConfig } from "./config/env.js";
+import { closeDb } from "./db/index.js";
 
 export interface StartServerOptions {
   config?: Partial<EnvConfig>;
@@ -33,7 +34,14 @@ export async function startServer(
     ...options.config,
   };
 
-  const app = options.app ?? createApp({ config: env });
+  let isShuttingDown = false;
+
+  const app =
+    options.app ??
+    createApp({
+      config: env,
+      isShuttingDown: () => isShuttingDown,
+    });
   const shutdownTimeoutMs = options.shutdownTimeoutMs ?? 5000;
   const registerSignals = options.registerSignalHandlers ?? false;
 
@@ -69,7 +77,6 @@ export async function startServer(
         boundHost = addrInfo.address;
       }
 
-      let isShuttingDown = false;
       let shutdownPromise: Promise<void> | null = null;
 
       // Bounded graceful shutdown sequence
@@ -80,44 +87,56 @@ export async function startServer(
 
         isShuttingDown = true;
 
-        shutdownPromise = new Promise<void>((resolveShutdown, rejectShutdown) => {
-          let forceCloseTimer: NodeJS.Timeout | null = null;
+        shutdownPromise = (async () => {
+          // 1. Drain and close HTTP server connections
+          await new Promise<void>((resolveShutdown, rejectShutdown) => {
+            let forceCloseTimer: NodeJS.Timeout | null = null;
 
-          // Stop accepting new connections
-          nodeServer.close((closeErr) => {
-            if (forceCloseTimer) {
-              clearTimeout(forceCloseTimer);
+            // Stop accepting new connections
+            nodeServer.close((closeErr) => {
+              if (forceCloseTimer) {
+                clearTimeout(forceCloseTimer);
+              }
+              if (closeErr) {
+                rejectShutdown(closeErr);
+              } else {
+                resolveShutdown();
+              }
+            });
+
+            // Close idle keep-alive connections immediately
+            if (
+              "closeIdleConnections" in nodeServer &&
+              typeof (nodeServer as { closeIdleConnections?: () => void }).closeIdleConnections === "function"
+            ) {
+              (nodeServer as { closeIdleConnections: () => void }).closeIdleConnections();
             }
-            if (closeErr) {
-              rejectShutdown(closeErr);
-            } else {
-              resolveShutdown();
+
+            // Force-close in-flight connections that exceed the shutdown timeout boundary
+            forceCloseTimer = setTimeout(() => {
+              if (
+                "closeAllConnections" in nodeServer &&
+                typeof (nodeServer as { closeAllConnections?: () => void }).closeAllConnections === "function"
+              ) {
+                (nodeServer as { closeAllConnections: () => void }).closeAllConnections();
+              }
+            }, shutdownTimeoutMs);
+
+            // Allow event loop to exit naturally if all connections drain before timer
+            if (typeof forceCloseTimer.unref === "function") {
+              forceCloseTimer.unref();
             }
           });
 
-          // Close idle keep-alive connections immediately
-          if ("closeIdleConnections" in nodeServer && typeof (nodeServer as { closeIdleConnections?: () => void }).closeIdleConnections === "function") {
-            (nodeServer as { closeIdleConnections: () => void }).closeIdleConnections();
+          // 2. Close database connection pool with bounded timeout (2s)
+          await closeDb();
+
+          // Remove signal handlers upon shutdown completion if they were registered
+          if (registerSignals) {
+            process.off("SIGINT", onSigint);
+            process.off("SIGTERM", onSigterm);
           }
-
-          // Force-close in-flight connections that exceed the shutdown timeout boundary
-          forceCloseTimer = setTimeout(() => {
-            if ("closeAllConnections" in nodeServer && typeof (nodeServer as { closeAllConnections?: () => void }).closeAllConnections === "function") {
-              (nodeServer as { closeAllConnections: () => void }).closeAllConnections();
-            }
-          }, shutdownTimeoutMs);
-
-          // Allow event loop to exit naturally if all connections drain before timer
-          if (typeof forceCloseTimer.unref === "function") {
-            forceCloseTimer.unref();
-          }
-        });
-
-        // Remove signal handlers upon shutdown completion if they were registered
-        if (registerSignals) {
-          process.off("SIGINT", onSigint);
-          process.off("SIGTERM", onSigterm);
-        }
+        })();
 
         return shutdownPromise;
       };
