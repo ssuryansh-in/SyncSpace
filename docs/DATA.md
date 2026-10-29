@@ -10,6 +10,8 @@ The authoritative data model consists of 9 core tables managed via Drizzle ORM a
 
 ```mermaid
 erDiagram
+    users ||--o{ sessions : owns
+    users ||--o{ accounts : owns
     users ||--o{ workspaces : owns
     users ||--o{ workspace_members : participates
     workspaces ||--|{ workspace_members : contains
@@ -29,11 +31,14 @@ erDiagram
 ---
 
 ### 1.1 `users`
-Represents registered users in the system. Authentication credential tables are managed alongside this model via Better Auth.
+Represents registered users in the system. Extended in Milestone 3 to support Better Auth authentication tables.
 - `id UUID PRIMARY KEY DEFAULT gen_random_uuid()`
 - `email CITEXT UNIQUE NOT NULL`
 - `display_name TEXT NOT NULL`
+- `email_verified BOOLEAN NOT NULL DEFAULT false`
+- `image TEXT NULL`
 - `created_at TIMESTAMPTZ NOT NULL DEFAULT now()`
+- `updated_at TIMESTAMPTZ NOT NULL DEFAULT now()`
 
 ### 1.2 `workspaces`
 The top-level multi-tenant boundary.
@@ -128,6 +133,45 @@ Ensures safe retry semantics for creation endpoints.
 - `created_at TIMESTAMPTZ NOT NULL DEFAULT now()`
 - **Constraint:** `UNIQUE (actor_id, endpoint_key, idempotency_key)`
 - **Retention:** Records are retained for at least 24 hours before cleanup.
+
+### 1.10 `sessions`
+Database-backed session storage for revocable user authentication sessions.
+- `id UUID PRIMARY KEY DEFAULT gen_random_uuid()`
+- `user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE`
+- `token TEXT UNIQUE NOT NULL`
+- `expires_at TIMESTAMPTZ NOT NULL`
+- `ip_address TEXT NULL`
+- `user_agent TEXT NULL`
+- `created_at TIMESTAMPTZ NOT NULL DEFAULT now()`
+- `updated_at TIMESTAMPTZ NOT NULL DEFAULT now()`
+- **Indexes:** `UNIQUE (token)`, B-tree index on `user_id` (`idx_sessions_user_id`).
+
+### 1.11 `accounts`
+Stores authentication providers and credentials (including Argon2id password hashes for local email/password sign-in).
+- `id UUID PRIMARY KEY DEFAULT gen_random_uuid()`
+- `user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE`
+- `account_id TEXT NOT NULL`
+- `provider_id TEXT NOT NULL`
+- `access_token TEXT NULL`
+- `refresh_token TEXT NULL`
+- `id_token TEXT NULL`
+- `access_token_expires_at TIMESTAMPTZ NULL`
+- `refresh_token_expires_at TIMESTAMPTZ NULL`
+- `scope TEXT NULL`
+- `password TEXT NULL`
+- `created_at TIMESTAMPTZ NOT NULL DEFAULT now()`
+- `updated_at TIMESTAMPTZ NOT NULL DEFAULT now()`
+- **Indexes:** B-tree index on `user_id` (`idx_accounts_user_id`).
+
+### 1.12 `verifications`
+Stores time-limited verification tokens for email verification and password resets.
+- `id UUID PRIMARY KEY DEFAULT gen_random_uuid()`
+- `identifier TEXT NOT NULL`
+- `value TEXT NOT NULL`
+- `expires_at TIMESTAMPTZ NOT NULL`
+- `created_at TIMESTAMPTZ NOT NULL DEFAULT now()`
+- `updated_at TIMESTAMPTZ NOT NULL DEFAULT now()`
+- **Indexes:** B-tree index on `identifier` (`idx_verifications_identifier`).
 
 ---
 

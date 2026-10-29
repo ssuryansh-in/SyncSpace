@@ -10,6 +10,8 @@ describe("Environment Configuration (loadEnv)", () => {
     expect(config.HOST).toBe("127.0.0.1");
     expect(config.DB_POOL_MAX).toBe(10);
     expect(config.DATABASE_URL).toBeUndefined();
+    expect(config.BETTER_AUTH_SECRET).toBeUndefined();
+    expect(config.BETTER_AUTH_URL).toBeUndefined();
   });
 
   it("parses valid custom values correctly", () => {
@@ -19,6 +21,8 @@ describe("Environment Configuration (loadEnv)", () => {
       HOST: "0.0.0.0",
       DATABASE_URL: "postgres://user:password@localhost:5432/syncspace",
       DB_POOL_MAX: "25",
+      BETTER_AUTH_SECRET: "a_very_secure_secret_with_more_than_32_characters_here",
+      BETTER_AUTH_URL: "https://auth.example.com:8080",
     });
 
     expect(config.NODE_ENV).toBe("production");
@@ -28,6 +32,10 @@ describe("Environment Configuration (loadEnv)", () => {
       "postgres://user:password@localhost:5432/syncspace"
     );
     expect(config.DB_POOL_MAX).toBe(25);
+    expect(config.BETTER_AUTH_SECRET).toBe(
+      "a_very_secure_secret_with_more_than_32_characters_here"
+    );
+    expect(config.BETTER_AUTH_URL).toBe("https://auth.example.com:8080");
   });
 
   it("accepts postgresql:// protocol alias", () => {
@@ -118,6 +126,93 @@ describe("Environment Configuration (loadEnv)", () => {
         NODE_ENV: "production",
       })
     ).toThrowError(/DATABASE_URL is required in production/);
+  });
+
+  it("requires BETTER_AUTH_SECRET when NODE_ENV is production", () => {
+    expect(() =>
+      loadEnv({
+        NODE_ENV: "production",
+        DATABASE_URL: "postgres://user:password@localhost:5432/syncspace",
+        BETTER_AUTH_URL: "https://auth.example.com",
+      })
+    ).toThrowError(/BETTER_AUTH_SECRET is required in production/);
+  });
+
+  it("requires BETTER_AUTH_URL when NODE_ENV is production", () => {
+    expect(() =>
+      loadEnv({
+        NODE_ENV: "production",
+        DATABASE_URL: "postgres://user:password@localhost:5432/syncspace",
+        BETTER_AUTH_SECRET: "a_very_secure_secret_with_more_than_32_characters_here",
+      })
+    ).toThrowError(/BETTER_AUTH_URL is required in production/);
+  });
+
+  it("accepts a production HTTPS authentication URL when production settings are valid", () => {
+    const config = loadEnv({
+      NODE_ENV: "production",
+      DATABASE_URL: "postgres://user:password@localhost:5432/syncspace",
+      BETTER_AUTH_SECRET: "a_very_secure_secret_with_more_than_32_characters_here",
+      BETTER_AUTH_URL: "https://auth.syncspace.dev",
+    });
+
+    expect(config.BETTER_AUTH_URL).toBe("https://auth.syncspace.dev");
+  });
+
+  it("rejects non-HTTPS BETTER_AUTH_URL when NODE_ENV is production", () => {
+    expect(() =>
+      loadEnv({
+        NODE_ENV: "production",
+        DATABASE_URL: "postgres://user:password@localhost:5432/syncspace",
+        BETTER_AUTH_SECRET: "a_very_secure_secret_with_more_than_32_characters_here",
+        BETTER_AUTH_URL: "http://auth.syncspace.dev",
+      })
+    ).toThrowError(/BETTER_AUTH_URL must use https:\/\/ protocol in production/);
+  });
+
+  it("allows HTTP BETTER_AUTH_URL in development and test environments", () => {
+    const devConfig = loadEnv({
+      NODE_ENV: "development",
+      BETTER_AUTH_URL: "http://127.0.0.1:4000",
+    });
+    expect(devConfig.BETTER_AUTH_URL).toBe("http://127.0.0.1:4000");
+
+    const testConfig = loadEnv({
+      NODE_ENV: "test",
+      BETTER_AUTH_URL: "http://localhost:4000",
+    });
+    expect(testConfig.BETTER_AUTH_URL).toBe("http://localhost:4000");
+  });
+
+  it("rejects BETTER_AUTH_SECRET shorter than 32 characters", () => {
+    expect(() =>
+      loadEnv({
+        BETTER_AUTH_SECRET: "short-secret",
+      })
+    ).toThrowError(/BETTER_AUTH_SECRET must be at least 32 characters long/);
+  });
+
+  it("rejects malformed BETTER_AUTH_URL values", () => {
+    expect(() =>
+      loadEnv({
+        BETTER_AUTH_URL: "not-a-valid-url",
+      })
+    ).toThrowError(/BETTER_AUTH_URL must be a valid URL/);
+  });
+
+  it("does not leak BETTER_AUTH_SECRET in validation errors", () => {
+    const rawSecret = "too-short-secret-leaked?";
+    try {
+      loadEnv({
+        BETTER_AUTH_SECRET: rawSecret,
+      });
+      expect.unreachable("Should have thrown validation error");
+    } catch (err: unknown) {
+      expect(err).toBeInstanceOf(Error);
+      const message = (err as Error).message;
+      expect(message).toContain("BETTER_AUTH_SECRET");
+      expect(message).not.toContain(rawSecret);
+    }
   });
 
   it("rejects invalid DB_POOL_MAX values (< 1 or > 100)", () => {

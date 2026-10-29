@@ -53,14 +53,44 @@ const envSchema = z
         .min(1, "DB_POOL_MAX must be at least 1")
         .max(100, "DB_POOL_MAX cannot exceed 100"))
       .default(10),
+    BETTER_AUTH_SECRET: z
+      .string({ invalid_type_error: "BETTER_AUTH_SECRET must be a string" })
+      .min(32, "BETTER_AUTH_SECRET must be at least 32 characters long")
+      .optional(),
+    BETTER_AUTH_URL: z
+      .string({ invalid_type_error: "BETTER_AUTH_URL must be a string" })
+      .url("BETTER_AUTH_URL must be a valid URL")
+      .optional(),
   })
   .superRefine((data, ctx) => {
-    if (data.NODE_ENV === "production" && !data.DATABASE_URL) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        path: ["DATABASE_URL"],
-        message: "DATABASE_URL is required in production",
-      });
+    if (data.NODE_ENV === "production") {
+      if (!data.DATABASE_URL) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["DATABASE_URL"],
+          message: "DATABASE_URL is required in production",
+        });
+      }
+      if (!data.BETTER_AUTH_SECRET) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["BETTER_AUTH_SECRET"],
+          message: "BETTER_AUTH_SECRET is required in production",
+        });
+      }
+      if (!data.BETTER_AUTH_URL) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["BETTER_AUTH_URL"],
+          message: "BETTER_AUTH_URL is required in production",
+        });
+      } else if (!data.BETTER_AUTH_URL.startsWith("https://")) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["BETTER_AUTH_URL"],
+          message: "BETTER_AUTH_URL must use https:// protocol in production",
+        });
+      }
     }
   });
 

@@ -8,6 +8,13 @@
       "when": 1793213795393,
       "tag": "0000_futuristic_brood",
       "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "7",
+      "when": 1793256024551,
+      "tag": "0001_auth_tables",
+      "breakpoints": true
     }
   ]
 }

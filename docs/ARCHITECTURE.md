@@ -76,6 +76,7 @@ flowchart TD
 - **Strict Authorization Rule:** Authorization is enforced in the service layer using the authenticated user ID and the target resource's workspace ID. Client-provided resource IDs are **never** trusted as proof of authorization.
 
 ### 2.4 Data Access Layer (Drizzle ORM & PostgreSQL Connections)
+- **Unified Drizzle Schema & Migration Pipeline:** Both domain tables (`users`, `workspaces`, `tasks`, etc.) and Better Auth tables (`sessions`, `accounts`, `verifications`) are managed under a single unified Drizzle ORM schema and migration pipeline (`0000_futuristic_brood.sql`, `0001_auth_tables.sql`).
 - **Primary Connection Pool:** Used for ordinary application queries, REST endpoints, and transactional domain mutations. Runs under PostgreSQL `READ COMMITTED` isolation.
 - **Dedicated Listener Connection:** A dedicated, long-lived PostgreSQL connection reserved exclusively for `LISTEN` subscriptions (`project_events` and `membership_changes`). This connection bypasses transaction-level pooling proxies (e.g., PgBouncer transaction mode) because `LISTEN` is session-scoped.
 

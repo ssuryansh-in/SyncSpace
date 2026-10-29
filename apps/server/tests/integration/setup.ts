@@ -17,12 +17,15 @@ export let testDb: PostgresJsDatabase<typeof schema>;
 let lockConnection: postgres.Sql | null = null;
 
 /**
- * Truncates all domain tables in cascade to ensure a clean slate.
+ * Truncates all domain and authentication tables in cascade to ensure a clean slate.
  */
 export async function cleanTables(sqlClient: postgres.Sql = testSqlClient): Promise<void> {
   await sqlClient`
     TRUNCATE TABLE
       users,
+      sessions,
+      accounts,
+      verifications,
       workspaces,
       workspace_members,
       projects,

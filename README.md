@@ -123,11 +123,13 @@ The system baseline requires passing the following criteria under a documented b
 - pnpm (tested on pnpm v12.3.4)
 - Docker Desktop or PostgreSQL 16 (for database and integration tests)
 
-### Database Setup (Milestone 2)
+### Database & Migration Pipeline (Milestones 2 & 3)
 - **Start PostgreSQL container:** `docker compose up -d`
 - **Stop PostgreSQL container:** `docker compose down`
 - **Generate migrations:** `pnpm --filter @syncspace/server db:generate`
 - **Apply migrations:** `pnpm --filter @syncspace/server db:migrate`
+  - `0000_futuristic_brood.sql`: Nine canonical domain tables, CITEXT extension, and core foreign keys.
+  - `0001_auth_tables.sql`: Better Auth authentication tables (`sessions`, `accounts`, `verifications`) and `users` extensions (`email_verified`, `image`, `updated_at`).
 
 ### Package & Workspace Commands
 - **Install dependencies:** `pnpm install`

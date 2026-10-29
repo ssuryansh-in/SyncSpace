@@ -1,12 +1,15 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import { cleanTables, testDb, testSqlClient } from "./setup.js";
 import {
+  accounts,
   idempotencyRecords,
   projectColumns,
   projectEvents,
   projects,
+  sessions,
   tasks,
   users,
+  verifications,
   workspaceMembers,
   workspaces,
 } from "../../src/db/schema/index.js";
@@ -31,6 +34,22 @@ describe("Database Schema & Constraints (Integration)", () => {
         displayName: "Duplicate User",
       })
     ).rejects.toThrow();
+  });
+
+  it("enforces default values for new user columns (email_verified, image, updated_at)", async () => {
+    const [user] = await testDb
+      .insert(users)
+      .values({
+        email: "defaults@syncspace.local",
+        displayName: "Defaults User",
+      })
+      .returning();
+
+    expect(user).toBeDefined();
+    expect(user!.emailVerified).toBe(false);
+    expect(user!.image).toBeNull();
+    expect(user!.createdAt).toBeInstanceOf(Date);
+    expect(user!.updatedAt).toBeInstanceOf(Date);
   });
 
   it("enforces role check constraint on workspace_members", async () => {
@@ -208,5 +227,136 @@ describe("Database Schema & Constraints (Integration)", () => {
         responseBody: { taskId: "456" },
       })
     ).rejects.toThrow();
+  });
+
+  it("Scenario 4: cascades user deletion to sessions and accounts for dedicated user without domain references", async () => {
+    // Insert dedicated test user with NO inbound domain references
+    const [dedicatedUser] = await testDb
+      .insert(users)
+      .values({
+        email: "dedicated.cascade@syncspace.local",
+        displayName: "Dedicated Cascade User",
+      })
+      .returning();
+
+    // Insert associated session and account records
+    const [session] = await testDb
+      .insert(sessions)
+      .values({
+        userId: dedicatedUser!.id,
+        token: "cascade-session-token-12345",
+        expiresAt: new Date(Date.now() + 86400000),
+      })
+      .returning();
+
+    const [account] = await testDb
+      .insert(accounts)
+      .values({
+        userId: dedicatedUser!.id,
+        accountId: "acc-cascade-12345",
+        providerId: "credential",
+      })
+      .returning();
+
+    expect(session).toBeDefined();
+    expect(account).toBeDefined();
+
+    // Delete the dedicated user
+    await testDb.delete(users).where(eq(users.id, dedicatedUser!.id));
+
+    // Assert that sessions and accounts are removed through ON DELETE CASCADE
+    const remainingSessions = await testDb
+      .select()
+      .from(sessions)
+      .where(eq(sessions.userId, dedicatedUser!.id));
+    expect(remainingSessions.length).toBe(0);
+
+    const remainingAccounts = await testDb
+      .select()
+      .from(accounts)
+      .where(eq(accounts.userId, dedicatedUser!.id));
+    expect(remainingAccounts.length).toBe(0);
+  });
+
+  it("preserves domain foreign key deletion policies (ON DELETE NO ACTION on workspaces.owner_id)", async () => {
+    const [ownerUser] = await testDb
+      .insert(users)
+      .values({
+        email: "workspace.owner@syncspace.local",
+        displayName: "Workspace Owner",
+      })
+      .returning();
+
+    await testDb.insert(workspaces).values({
+      name: "Owner Protected Workspace",
+      ownerId: ownerUser!.id,
+    });
+
+    // Attempting to delete a user who owns a workspace must fail via workspaces_owner_id_users_id_fk (NO ACTION)
+    await expect(
+      testDb.delete(users).where(eq(users.id, ownerUser!.id))
+    ).rejects.toThrow();
+  });
+
+  it("Scenario 5: enforces unique constraint on sessions.token", async () => {
+    const [user] = await testDb
+      .insert(users)
+      .values({ email: "session.token@syncspace.local", displayName: "Session User" })
+      .returning();
+
+    await testDb.insert(sessions).values({
+      userId: user!.id,
+      token: "unique-session-token-abc",
+      expiresAt: new Date(Date.now() + 86400000),
+    });
+
+    // Duplicate token must fail
+    await expect(
+      testDb.insert(sessions).values({
+        userId: user!.id,
+        token: "unique-session-token-abc",
+        expiresAt: new Date(Date.now() + 86400000),
+      })
+    ).rejects.toThrow();
+  });
+
+  it("Scenario 5: enforces foreign key constraint on sessions.user_id and accounts.user_id", async () => {
+    const nonExistentUserId = "00000000-0000-0000-0000-000000000000";
+
+    // Invalid userId in sessions
+    await expect(
+      testDb.insert(sessions).values({
+        userId: nonExistentUserId,
+        token: "orphan-session-token",
+        expiresAt: new Date(Date.now() + 86400000),
+      })
+    ).rejects.toThrow();
+
+    // Invalid userId in accounts
+    await expect(
+      testDb.insert(accounts).values({
+        userId: nonExistentUserId,
+        accountId: "acc-orphan",
+        providerId: "credential",
+      })
+    ).rejects.toThrow();
+  });
+
+  it("Scenario 5: inserts and queries verifications correctly", async () => {
+    const [verification] = await testDb
+      .insert(verifications)
+      .values({
+        identifier: "user@example.com",
+        value: "token-value-verify-123",
+        expiresAt: new Date(Date.now() + 3600000),
+      })
+      .returning();
+
+    expect(verification).toBeDefined();
+    expect(verification!.identifier).toBe("user@example.com");
+    expect(verification!.value).toBe("token-value-verify-123");
+    expect(verification!.id).toBeDefined();
+    expect(verification!.createdAt).toBeInstanceOf(Date);
+    expect(verification!.updatedAt).toBeInstanceOf(Date);
   });
 });
