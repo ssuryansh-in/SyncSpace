@@ -1,12 +1,14 @@
 import { Hono } from "hono";
 import { healthRoute } from "./routes/health.js";
 import { createReadyRoute } from "./routes/ready.js";
+import { createAuth, type Auth } from "./auth/index.js";
 import type { EnvConfig } from "./config/env.js";
 
 export interface AppOptions {
-  config?: EnvConfig;
-  checkDb?: () => Promise<{ ok: boolean; error?: string }>;
-  isShuttingDown?: () => boolean;
+  config?: EnvConfig | undefined;
+  checkDb?: (() => Promise<{ ok: boolean; error?: string }>) | undefined;
+  isShuttingDown?: (() => boolean) | undefined;
+  auth?: Auth | undefined;
 }
 
 /**
@@ -15,6 +17,7 @@ export interface AppOptions {
  */
 export function createApp(options: AppOptions = {}): Hono {
   const app = new Hono();
+  const authInstance = options.auth ?? createAuth({ env: options.config });
 
   // Standardized 404 Not Found handler
   app.notFound((c) => {
@@ -48,6 +51,7 @@ export function createApp(options: AppOptions = {}): Hono {
   });
 
   // Mount routes
+  app.on(["POST", "GET"], "/api/auth/*", (c) => authInstance.handler(c.req.raw));
   app.route("/health", healthRoute);
   app.route(
     "/ready",

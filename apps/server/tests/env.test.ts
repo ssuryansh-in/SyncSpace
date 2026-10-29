@@ -12,6 +12,9 @@ describe("Environment Configuration (loadEnv)", () => {
     expect(config.DATABASE_URL).toBeUndefined();
     expect(config.BETTER_AUTH_SECRET).toBeUndefined();
     expect(config.BETTER_AUTH_URL).toBeUndefined();
+    expect(config.ALLOWED_ORIGINS).toBe("http://localhost:3000");
+    expect(config.EMAIL_FROM).toBe("SyncSpace <noreply@syncspace.dev>");
+    expect(config.RESEND_API_KEY).toBeUndefined();
   });
 
   it("parses valid custom values correctly", () => {
@@ -23,6 +26,9 @@ describe("Environment Configuration (loadEnv)", () => {
       DB_POOL_MAX: "25",
       BETTER_AUTH_SECRET: "a_very_secure_secret_with_more_than_32_characters_here",
       BETTER_AUTH_URL: "https://auth.example.com:8080",
+      ALLOWED_ORIGINS: "https://app.example.com,https://admin.example.com",
+      EMAIL_FROM: "SyncSpace Team <team@example.com>",
+      RESEND_API_KEY: "re_1234567890abcdef",
     });
 
     expect(config.NODE_ENV).toBe("production");
@@ -36,6 +42,9 @@ describe("Environment Configuration (loadEnv)", () => {
       "a_very_secure_secret_with_more_than_32_characters_here"
     );
     expect(config.BETTER_AUTH_URL).toBe("https://auth.example.com:8080");
+    expect(config.ALLOWED_ORIGINS).toBe("https://app.example.com,https://admin.example.com");
+    expect(config.EMAIL_FROM).toBe("SyncSpace Team <team@example.com>");
+    expect(config.RESEND_API_KEY).toBe("re_1234567890abcdef");
   });
 
   it("accepts postgresql:// protocol alias", () => {
@@ -148,12 +157,24 @@ describe("Environment Configuration (loadEnv)", () => {
     ).toThrowError(/BETTER_AUTH_URL is required in production/);
   });
 
+  it("requires RESEND_API_KEY when NODE_ENV is production", () => {
+    expect(() =>
+      loadEnv({
+        NODE_ENV: "production",
+        DATABASE_URL: "postgres://user:password@localhost:5432/syncspace",
+        BETTER_AUTH_SECRET: "a_very_secure_secret_with_more_than_32_characters_here",
+        BETTER_AUTH_URL: "https://auth.syncspace.dev",
+      })
+    ).toThrowError(/RESEND_API_KEY is required in production/);
+  });
+
   it("accepts a production HTTPS authentication URL when production settings are valid", () => {
     const config = loadEnv({
       NODE_ENV: "production",
       DATABASE_URL: "postgres://user:password@localhost:5432/syncspace",
       BETTER_AUTH_SECRET: "a_very_secure_secret_with_more_than_32_characters_here",
       BETTER_AUTH_URL: "https://auth.syncspace.dev",
+      RESEND_API_KEY: "re_valid_api_key_here",
     });
 
     expect(config.BETTER_AUTH_URL).toBe("https://auth.syncspace.dev");
@@ -166,6 +187,7 @@ describe("Environment Configuration (loadEnv)", () => {
         DATABASE_URL: "postgres://user:password@localhost:5432/syncspace",
         BETTER_AUTH_SECRET: "a_very_secure_secret_with_more_than_32_characters_here",
         BETTER_AUTH_URL: "http://auth.syncspace.dev",
+        RESEND_API_KEY: "re_valid_api_key_here",
       })
     ).toThrowError(/BETTER_AUTH_URL must use https:\/\/ protocol in production/);
   });

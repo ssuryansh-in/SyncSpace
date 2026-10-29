@@ -61,6 +61,17 @@ const envSchema = z
       .string({ invalid_type_error: "BETTER_AUTH_URL must be a string" })
       .url("BETTER_AUTH_URL must be a valid URL")
       .optional(),
+    ALLOWED_ORIGINS: z
+      .string({ invalid_type_error: "ALLOWED_ORIGINS must be a string" })
+      .default("http://localhost:3000"),
+    EMAIL_FROM: z
+      .string({ invalid_type_error: "EMAIL_FROM must be a string" })
+      .min(1, "EMAIL_FROM cannot be empty")
+      .default("SyncSpace <noreply@syncspace.dev>"),
+    RESEND_API_KEY: z
+      .string({ invalid_type_error: "RESEND_API_KEY must be a string" })
+      .min(1, "RESEND_API_KEY cannot be empty")
+      .optional(),
   })
   .superRefine((data, ctx) => {
     if (data.NODE_ENV === "production") {
@@ -89,6 +100,13 @@ const envSchema = z
           code: z.ZodIssueCode.custom,
           path: ["BETTER_AUTH_URL"],
           message: "BETTER_AUTH_URL must use https:// protocol in production",
+        });
+      }
+      if (!data.RESEND_API_KEY) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["RESEND_API_KEY"],
+          message: "RESEND_API_KEY is required in production",
         });
       }
     }

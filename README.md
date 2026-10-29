@@ -96,6 +96,8 @@ The backend application requires the following environment variables:
 | `BETTER_AUTH_SECRET` | Secret key used for session signing and crypto | `super-secret-random-key-at-least-32-chars` |
 | `BETTER_AUTH_URL` | Base URL for auth callbacks and session cookies | `http://localhost:4000` |
 | `ALLOWED_ORIGINS` | Comma-separated allowlist for CORS and WebSockets | `http://localhost:3000` |
+| `EMAIL_FROM` | Sender address for outgoing system emails | `SyncSpace <noreply@syncspace.dev>` |
+| `RESEND_API_KEY` | Resend API key for production email delivery | `re_...` (optional in dev/test) |
 
 ---
 
