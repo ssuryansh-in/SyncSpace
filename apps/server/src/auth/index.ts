@@ -59,6 +59,15 @@ export function createAuth(options: CreateAuthOptions = {}) {
       enabled: true,
       requireEmailVerification: true,
       autoSignIn: false,
+      revokeSessionsOnPasswordReset: true,
+      resetPasswordTokenExpiresIn: 3600,
+      sendResetPassword: async ({ user, url }) => {
+        await emailService.sendPasswordResetEmail({
+          email: user.email,
+          displayName: user.name,
+          resetUrl: url,
+        });
+      },
       password: {
         hash: async (password: string) => {
           return argon2.hash(password, {

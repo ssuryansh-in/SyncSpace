@@ -221,5 +221,80 @@ describe("Email Service", () => {
       globalThis.fetch = originalFetch;
     }
   });
+
+  it("simulates password reset email delivery in test environment without calling external API", async () => {
+    const service = createEmailService(
+      loadEnv({
+        NODE_ENV: "test",
+      })
+    );
+
+    const result = await service.sendPasswordResetEmail({
+      email: "reset-user@example.com",
+      displayName: "Reset User",
+      resetUrl: "http://127.0.0.1:4000/api/auth/reset-password/abc123xyz?callbackURL=%2F",
+    });
+
+    expect(result.simulated).toBe(true);
+    const sent = getSentEmailsForTest();
+    expect(sent.length).toBe(1);
+    expect(sent[0].to).toBe("reset-user@example.com");
+    expect(sent[0].subject).toBe("Reset your SyncSpace password");
+    expect(sent[0].html).toContain("Reset your password, Reset User");
+    expect(sent[0].html).toContain("http://127.0.0.1:4000/api/auth/reset-password/abc123xyz");
+    expect(sent[0].text).toContain("http://127.0.0.1:4000/api/auth/reset-password/abc123xyz");
+  });
+
+  it("regression: prevents leakage of reset tokens and URLs when sending password reset email fails", async () => {
+    const mockEnv = loadEnv({
+      NODE_ENV: "production",
+      DATABASE_URL: "postgres://user:pass@localhost:5432/syncspace",
+      BETTER_AUTH_SECRET: "12345678901234567890123456789012",
+      BETTER_AUTH_URL: "https://auth.example.com",
+      RESEND_API_KEY: "re_fake_secret_key_12345",
+    });
+
+    const resetToken = "sensitive-password-reset-token-999";
+    const resetUrl = `https://auth.example.com/api/auth/reset-password/${resetToken}?callbackURL=https%3A%2F%2Fapp.example.com`;
+
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async () =>
+      new Response(
+        JSON.stringify({
+          name: "delivery_error",
+          message: `Failed to dispatch to ${resetUrl} with token=${resetToken} and key re_fake_secret_key_12345`,
+        }),
+        {
+          status: 400,
+          headers: { "Content-Type": "application/json" },
+        }
+      );
+
+    try {
+      const service = createEmailService(mockEnv);
+      let errorThrown: Error | null = null;
+      try {
+        await service.sendPasswordResetEmail({
+          email: "user@example.com",
+          displayName: "User",
+          resetUrl,
+        });
+      } catch (err) {
+        errorThrown = err as Error;
+      }
+
+      expect(errorThrown).not.toBeNull();
+      const msg = errorThrown!.message;
+      expect(msg).toContain("Email provider error (400): delivery_error");
+      expect(msg).not.toContain(resetToken);
+      expect(msg).not.toContain(resetUrl);
+      expect(msg).not.toContain("re_fake_secret_key_12345");
+      expect(msg).toContain("[REDACTED_URL]");
+      expect(msg).toContain("[REDACTED_KEY]");
+      expect(msg).toContain("token=[REDACTED_TOKEN]");
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
 });
 

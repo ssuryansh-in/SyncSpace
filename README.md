@@ -70,6 +70,7 @@ The project documentation establishes the engineering specifications, architectu
 6. **Real-Time Sync & Recovery:** Ephemeral WebSocket updates, PostgreSQL `LISTEN/NOTIFY` waking per-instance dispatchers, 1-second polling fallback, and client sequence catch-up.
 7. **Idempotency:** Mandatory `Idempotency-Key` headers for task and comment creation with duplicate race handling under `READ COMMITTED`.
 8. **Full-Text Search:** PostgreSQL full-text search with generated `tsvector` columns and a GIN index.
+9. **Authentication & Password Recovery:** Better Auth session-based authentication with Argon2id password hashing, mandatory email verification, single-use token lifecycle, revocable sessions, and self-service password recovery with session invalidation upon reset.
 
 ### Explicit Non-Goals for v1
 - Workspace deletion in normal workflows (reserved for future soft-deletion via `workspaces.deleted_at`).

@@ -107,7 +107,7 @@ The decisions in this section are mandatory engineering requirements established
 - **Specification Reference:** Sections 6.1, 12, 13.1, 21.
 - **Confirmed Requirement:** Use Better Auth for authentication, with Argon2id password hashing and database-backed revocable sessions.
 - **Design Rationale:** Eliminates the security risk of custom cryptography and password hashing. Database-backed sessions allow immediate revocation upon member removal or security events.
-- **Implementation Status (Phase 3.1 Completed):** Runtime initialized with Drizzle ORM PostgreSQL persistence, native `name -> displayName` field mapping, RFC 4122 v4 UUID identifiers, Argon2id hashing (`$argon2id$v=19$m=65536,p=4,t=3`), mandatory email verification (`requireEmailVerification: true`, `autoSignIn: false`), in-memory rate limiting for single-instance v1 deployment, and minimal Resend email dispatch with safe dev/test simulation.
+- **Implementation Status (Phase 3.1 & 3.2 Completed):** Runtime initialized with Drizzle ORM PostgreSQL persistence, native `name -> displayName` field mapping, RFC 4122 v4 UUID identifiers, Argon2id hashing (`$argon2id$v=19$m=65536,p=4,t=3`), mandatory email verification (`requireEmailVerification: true`, `autoSignIn: false`), in-memory rate limiting for single-instance v1 deployment, and minimal Resend email dispatch with safe dev/test simulation. Password recovery (Phase 3.2) implemented natively via Better Auth with 1-hour token expiry (`resetPasswordTokenExpiresIn: 3600`), single-use atomic consumption, automatic session revocation on password reset (`revokeSessionsOnPasswordReset: true`), enumeration resistance, Argon2id password hashing for new credentials, and email delivery error sanitization.
 
 ---
 

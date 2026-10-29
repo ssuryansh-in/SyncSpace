@@ -39,6 +39,11 @@ export interface EmailService {
     displayName: string;
     verificationUrl: string;
   }): Promise<{ id?: string; simulated?: boolean }>;
+  sendPasswordResetEmail(options: {
+    email: string;
+    displayName: string;
+    resetUrl: string;
+  }): Promise<{ id?: string; simulated?: boolean }>;
 }
 
 /**
@@ -110,7 +115,7 @@ export function createEmailService(
         if (typeof errJson?.name === "string" && errJson.name.length <= 100) {
           parts.push(errJson.name);
         }
-        if (typeof errJson?.message === "string" && errJson.message.length <= 200) {
+        if (typeof errJson?.message === "string" && errJson.message.length <= 500) {
           // Sanitize message: never leak URLs, verification tokens, or API keys
           const cleanMessage = errJson.message
             .replace(/https?:\/\/[^\s]+/gi, "[REDACTED_URL]")
@@ -167,9 +172,42 @@ export function createEmailService(
     });
   };
 
+  const sendPasswordResetEmail = async ({
+    email,
+    displayName,
+    resetUrl,
+  }: {
+    email: string;
+    displayName: string;
+    resetUrl: string;
+  }) => {
+    const subject = "Reset your SyncSpace password";
+    const safeName = displayName || "there";
+    const html = `
+      <div style="font-family: sans-serif; line-height: 1.5; color: #111;">
+        <h2>Reset your password, ${safeName}</h2>
+        <p>We received a request to reset your SyncSpace account password. Click the link below to set a new password:</p>
+        <p><a href="${resetUrl}" style="display: inline-block; padding: 10px 20px; background: #000; color: #fff; text-decoration: none; border-radius: 4px;">Reset Password</a></p>
+        <p>Or paste this URL into your browser:</p>
+        <p><a href="${resetUrl}">${resetUrl}</a></p>
+        <p>This link will expire in 1 hour. If you did not request this, you can safely ignore this email.</p>
+      </div>
+    `.trim();
+
+    const text = `Reset your password, ${safeName}\n\nWe received a request to reset your SyncSpace account password. Please visit:\n${resetUrl}\n\nThis link will expire in 1 hour. If you did not request this, you can safely ignore this email.`;
+
+    return sendEmail({
+      to: email,
+      subject,
+      html,
+      text,
+    });
+  };
+
   return {
     sendEmail,
     sendVerificationEmail,
+    sendPasswordResetEmail,
   };
 }
 

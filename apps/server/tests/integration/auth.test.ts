@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import { cleanTables, testDb, testSqlClient } from "./setup.js";
-import { users, accounts, sessions, workspaceMembers } from "../../src/db/schema/index.js";
+import { users, accounts, sessions, workspaceMembers, verifications } from "../../src/db/schema/index.js";
 import { eq } from "drizzle-orm";
 import argon2 from "argon2";
 import { createApp } from "../../src/app.js";
@@ -517,5 +517,660 @@ describe("Better Auth Runtime & Lifecycle (Integration)", () => {
     const sentEmails = getSentEmailsForTest();
     expect(sentEmails.length).toBe(1);
     expect(sentEmails[0].to).toBe("ada@example.com");
+  });
+
+  it("requests password reset for existing user and receives reset email with token", async () => {
+    // 1. Register and verify user
+    await app.request("/api/auth/sign-up/email", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Origin: "http://127.0.0.1:4000",
+      },
+      body: JSON.stringify({
+        name: "Henry Jekyll",
+        email: "henry@example.com",
+        password: "OldPassword123!",
+      }),
+    });
+
+    const [dbUser] = await testDb
+      .select()
+      .from(users)
+      .where(eq(users.email, "henry@example.com"));
+
+    await testDb
+      .update(users)
+      .set({ emailVerified: true })
+      .where(eq(users.id, dbUser.id));
+
+    clearSentEmailsForTest();
+
+    // 2. Request password reset
+    const resetReqRes = await app.request("/api/auth/request-password-reset", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Origin: "http://127.0.0.1:4000",
+      },
+      body: JSON.stringify({
+        email: "henry@example.com",
+      }),
+    });
+
+    expect(resetReqRes.status).toBe(200);
+    const resetReqBody = await resetReqRes.json();
+    expect(resetReqBody.status).toBe(true);
+
+    // 3. Verify email was dispatched with reset token URL
+    const sentEmails = getSentEmailsForTest();
+    expect(sentEmails.length).toBe(1);
+    expect(sentEmails[0].to).toBe("henry@example.com");
+    expect(sentEmails[0].subject).toBe("Reset your SyncSpace password");
+    expect(sentEmails[0].html).toContain("/reset-password/");
+
+    // Extract token
+    const tokenMatch = sentEmails[0].html.match(/reset-password\/([a-zA-Z0-9]+)/);
+    expect(tokenMatch).toBeTruthy();
+    const token = tokenMatch![1];
+
+    // 4. Verify PostgreSQL verifications table has the token row
+    const [dbVerification] = await testDb
+      .select()
+      .from(verifications)
+      .where(eq(verifications.identifier, `reset-password:${token}`));
+
+    expect(dbVerification).toBeDefined();
+    expect(dbVerification.value).toBe(dbUser.id);
+  });
+
+  it("protects against account enumeration on password reset request for nonexistent user", async () => {
+    const res = await app.request("/api/auth/request-password-reset", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Origin: "http://127.0.0.1:4000",
+      },
+      body: JSON.stringify({
+        email: "ghost-user@example.com",
+      }),
+    });
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.status).toBe(true);
+    expect(body.message).toContain("If this email exists");
+
+    // Zero emails dispatched
+    const sentEmails = getSentEmailsForTest();
+    expect(sentEmails.length).toBe(0);
+
+    // Zero verification records in DB
+    const allVerifications = await testDb.select().from(verifications);
+    expect(allVerifications.length).toBe(0);
+  });
+
+  it("resets password with valid token, hashes with Argon2id, and consumes token", async () => {
+    // 1. Create verified user
+    await app.request("/api/auth/sign-up/email", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Origin: "http://127.0.0.1:4000",
+      },
+      body: JSON.stringify({
+        name: "Isaac Newton",
+        email: "isaac@example.com",
+        password: "OldPassword123!",
+      }),
+    });
+
+    await testDb
+      .update(users)
+      .set({ emailVerified: true })
+      .where(eq(users.email, "isaac@example.com"));
+
+    clearSentEmailsForTest();
+
+    // 2. Request reset
+    await app.request("/api/auth/request-password-reset", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Origin: "http://127.0.0.1:4000",
+      },
+      body: JSON.stringify({
+        email: "isaac@example.com",
+      }),
+    });
+
+    const sentEmails = getSentEmailsForTest();
+    const token = sentEmails[0].html.match(/reset-password\/([a-zA-Z0-9]+)/)![1];
+
+    // 3. Reset password using valid token
+    const resetRes = await app.request("/api/auth/reset-password", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Origin: "http://127.0.0.1:4000",
+      },
+      body: JSON.stringify({
+        token,
+        newPassword: "NewCalculusPassword456!",
+      }),
+    });
+
+    expect(resetRes.status).toBe(200);
+    const resetBody = await resetRes.json();
+    expect(resetBody.status).toBe(true);
+
+    // 4. Token must be consumed and deleted from PostgreSQL verifications table
+    const dbVerifications = await testDb
+      .select()
+      .from(verifications)
+      .where(eq(verifications.identifier, `reset-password:${token}`));
+    expect(dbVerifications.length).toBe(0);
+
+    // 5. Verify password in accounts table is Argon2id
+    const [dbUser] = await testDb
+      .select()
+      .from(users)
+      .where(eq(users.email, "isaac@example.com"));
+
+    const [dbAccount] = await testDb
+      .select()
+      .from(accounts)
+      .where(eq(accounts.userId, dbUser.id));
+
+    expect(dbAccount.password!.startsWith("$argon2id$")).toBe(true);
+
+    // 6. Old password must be rejected on sign-in
+    const oldLoginRes = await app.request("/api/auth/sign-in/email", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Origin: "http://127.0.0.1:4000",
+      },
+      body: JSON.stringify({
+        email: "isaac@example.com",
+        password: "OldPassword123!",
+      }),
+    });
+    expect(oldLoginRes.status).toBe(401);
+
+    // 7. New password must be accepted on sign-in
+    const newLoginRes = await app.request("/api/auth/sign-in/email", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Origin: "http://127.0.0.1:4000",
+      },
+      body: JSON.stringify({
+        email: "isaac@example.com",
+        password: "NewCalculusPassword456!",
+      }),
+    });
+    expect(newLoginRes.status).toBe(200);
+    const newLoginBody = await newLoginRes.json();
+    expect(newLoginBody.token).toBeDefined();
+  });
+
+  it("rejects password reset with an already consumed or reused token", async () => {
+    // 1. Create verified user and request reset
+    await app.request("/api/auth/sign-up/email", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Origin: "http://127.0.0.1:4000",
+      },
+      body: JSON.stringify({
+        name: "Julia Robinson",
+        email: "julia@example.com",
+        password: "FirstPassword123!",
+      }),
+    });
+
+    await testDb
+      .update(users)
+      .set({ emailVerified: true })
+      .where(eq(users.email, "julia@example.com"));
+
+    clearSentEmailsForTest();
+
+    await app.request("/api/auth/request-password-reset", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Origin: "http://127.0.0.1:4000",
+      },
+      body: JSON.stringify({ email: "julia@example.com" }),
+    });
+
+    const token = getSentEmailsForTest()[0].html.match(/reset-password\/([a-zA-Z0-9]+)/)![1];
+
+    // 2. First reset (valid)
+    const firstReset = await app.request("/api/auth/reset-password", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Origin: "http://127.0.0.1:4000",
+      },
+      body: JSON.stringify({
+        token,
+        newPassword: "SecondPassword456!",
+      }),
+    });
+    expect(firstReset.status).toBe(200);
+
+    // 3. Second reset with identical consumed token (replay attack)
+    const secondReset = await app.request("/api/auth/reset-password", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Origin: "http://127.0.0.1:4000",
+      },
+      body: JSON.stringify({
+        token,
+        newPassword: "ThirdPassword789!",
+      }),
+    });
+
+    expect(secondReset.status).toBe(400);
+    const body = await secondReset.json();
+    expect(body.code).toBe("INVALID_TOKEN");
+  });
+
+  it("rejects password reset with invalid or expired token", async () => {
+    // 1. Invalid token
+    const invalidRes = await app.request("/api/auth/reset-password", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Origin: "http://127.0.0.1:4000",
+      },
+      body: JSON.stringify({
+        token: "nonexistent-invalid-token",
+        newPassword: "SomeNewPassword123!",
+      }),
+    });
+
+    expect(invalidRes.status).toBe(400);
+    const invalidBody = await invalidRes.json();
+    expect(invalidBody.code).toBe("INVALID_TOKEN");
+
+    // 2. Expired token in database
+    await app.request("/api/auth/sign-up/email", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Origin: "http://127.0.0.1:4000",
+      },
+      body: JSON.stringify({
+        name: "Karl Gauss",
+        email: "karl@example.com",
+        password: "OldPassword123!",
+      }),
+    });
+
+    const [dbUser] = await testDb
+      .select()
+      .from(users)
+      .where(eq(users.email, "karl@example.com"));
+
+    // Insert manually expired token
+    const expiredToken = "expired-token-gauss";
+    await testDb.insert(verifications).values({
+      id: "a0000000-0000-4000-8000-000000000001",
+      identifier: `reset-password:${expiredToken}`,
+      value: dbUser.id,
+      expiresAt: new Date(Date.now() - 3600000), // expired 1 hour ago
+      createdAt: new Date(Date.now() - 7200000),
+      updatedAt: new Date(Date.now() - 7200000),
+    });
+
+    const expiredRes = await app.request("/api/auth/reset-password", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Origin: "http://127.0.0.1:4000",
+      },
+      body: JSON.stringify({
+        token: expiredToken,
+        newPassword: "NewPassword123!",
+      }),
+    });
+
+    expect(expiredRes.status).toBe(400);
+    const expiredBody = await expiredRes.json();
+    expect(expiredBody.code).toBe("INVALID_TOKEN");
+  });
+
+  it("revokes all active sessions for the user upon successful password reset", async () => {
+    // 1. Create verified user and sign in to get active session
+    await app.request("/api/auth/sign-up/email", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Origin: "http://127.0.0.1:4000",
+      },
+      body: JSON.stringify({
+        name: "Leonhard Euler",
+        email: "euler@example.com",
+        password: "EulerPassword123!",
+      }),
+    });
+
+    await testDb
+      .update(users)
+      .set({ emailVerified: true })
+      .where(eq(users.email, "euler@example.com"));
+
+    const loginRes = await app.request("/api/auth/sign-in/email", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Origin: "http://127.0.0.1:4000",
+      },
+      body: JSON.stringify({
+        email: "euler@example.com",
+        password: "EulerPassword123!",
+      }),
+    });
+
+    const sessionCookie = loginRes.headers.get("set-cookie")!;
+    expect(sessionCookie).toBeTruthy();
+
+    // Verify session is active via get-session
+    const sessionRes1 = await app.request("/api/auth/get-session", {
+      headers: { Cookie: sessionCookie },
+    });
+    expect(sessionRes1.status).toBe(200);
+    const sessionBody1 = await sessionRes1.json();
+    expect(sessionBody1.user.email).toBe("euler@example.com");
+
+    clearSentEmailsForTest();
+
+    // 2. Request and execute password reset
+    await app.request("/api/auth/request-password-reset", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Origin: "http://127.0.0.1:4000",
+      },
+      body: JSON.stringify({ email: "euler@example.com" }),
+    });
+
+    const token = getSentEmailsForTest()[0].html.match(/reset-password\/([a-zA-Z0-9]+)/)![1];
+
+    const resetRes = await app.request("/api/auth/reset-password", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Origin: "http://127.0.0.1:4000",
+      },
+      body: JSON.stringify({
+        token,
+        newPassword: "BrandNewEulerPassword456!",
+      }),
+    });
+    expect(resetRes.status).toBe(200);
+
+    // 3. PostgreSQL sessions table must have 0 rows for this user
+    const [dbUser] = await testDb
+      .select()
+      .from(users)
+      .where(eq(users.email, "euler@example.com"));
+
+    const remainingSessions = await testDb
+      .select()
+      .from(sessions)
+      .where(eq(sessions.userId, dbUser.id));
+    expect(remainingSessions.length).toBe(0);
+
+    // 4. Old session cookie must now be invalid on get-session
+    const sessionRes2 = await app.request("/api/auth/get-session", {
+      headers: { Cookie: sessionCookie },
+    });
+    const sessionBody2 = await sessionRes2.json();
+    expect(sessionBody2).toBeNull();
+  });
+
+  it("prevents concurrent consumption of the exact same reset token", async () => {
+    // 1. Create verified user and request reset
+    await app.request("/api/auth/sign-up/email", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Origin: "http://127.0.0.1:4000",
+      },
+      body: JSON.stringify({
+        name: "Marie Curie",
+        email: "marie@example.com",
+        password: "InitialPassword123!",
+      }),
+    });
+
+    await testDb
+      .update(users)
+      .set({ emailVerified: true })
+      .where(eq(users.email, "marie@example.com"));
+
+    clearSentEmailsForTest();
+
+    await app.request("/api/auth/request-password-reset", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Origin: "http://127.0.0.1:4000",
+      },
+      body: JSON.stringify({ email: "marie@example.com" }),
+    });
+
+    const token = getSentEmailsForTest()[0].html.match(/reset-password\/([a-zA-Z0-9]+)/)![1];
+
+    // 2. Fire two concurrent reset requests with identical token
+    const [res1, res2] = await Promise.all([
+      app.request("/api/auth/reset-password", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Origin: "http://127.0.0.1:4000",
+        },
+        body: JSON.stringify({
+          token,
+          newPassword: "ConcurrentPasswordA123!",
+        }),
+      }),
+      app.request("/api/auth/reset-password", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Origin: "http://127.0.0.1:4000",
+        },
+        body: JSON.stringify({
+          token,
+          newPassword: "ConcurrentPasswordB456!",
+        }),
+      }),
+    ]);
+
+    const statuses = [res1.status, res2.status].sort();
+    // Exactly one must succeed (200) and the other must fail (400)
+    expect(statuses).toEqual([200, 400]);
+  });
+
+  it("preserves unverified status when an unverified user resets password", async () => {
+    // 1. Create unverified user
+    await app.request("/api/auth/sign-up/email", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Origin: "http://127.0.0.1:4000",
+      },
+      body: JSON.stringify({
+        name: "Niels Bohr",
+        email: "niels@example.com",
+        password: "OldBohrPassword123!",
+      }),
+    });
+
+    clearSentEmailsForTest();
+
+    // 2. Request and execute password reset
+    await app.request("/api/auth/request-password-reset", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Origin: "http://127.0.0.1:4000",
+      },
+      body: JSON.stringify({ email: "niels@example.com" }),
+    });
+
+    const token = getSentEmailsForTest()[0].html.match(/reset-password\/([a-zA-Z0-9]+)/)![1];
+
+    const resetRes = await app.request("/api/auth/reset-password", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Origin: "http://127.0.0.1:4000",
+      },
+      body: JSON.stringify({
+        token,
+        newPassword: "NewQuantumPassword456!",
+      }),
+    });
+    expect(resetRes.status).toBe(200);
+
+    // 3. User email_verified must still be false in PostgreSQL
+    const [dbUser] = await testDb
+      .select()
+      .from(users)
+      .where(eq(users.email, "niels@example.com"));
+    expect(dbUser.emailVerified).toBe(false);
+
+    // 4. Login attempt with new password must still be rejected because account is unverified
+    const loginRes = await app.request("/api/auth/sign-in/email", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Origin: "http://127.0.0.1:4000",
+      },
+      body: JSON.stringify({
+        email: "niels@example.com",
+        password: "NewQuantumPassword456!",
+      }),
+    });
+
+    expect(loginRes.status).toBe(403);
+    const loginBody = await loginRes.json();
+    expect(loginBody.code).toBe("EMAIL_NOT_VERIFIED");
+  });
+
+  it("rejects password reset request with untrusted redirectTo destination", async () => {
+    const res = await app.request("/api/auth/request-password-reset", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Origin: "http://127.0.0.1:4000",
+      },
+      body: JSON.stringify({
+        email: "someone@example.com",
+        redirectTo: "http://attacker-evil-site.com/steal-token",
+      }),
+    });
+
+    expect(res.status).toBe(403);
+  });
+
+  it("enforces rate limiting on rapid password reset requests when enabled", async () => {
+    const rateLimitedAuth = createAuth({
+      db: testDb,
+      env: testEnv,
+      emailService: testEmailService,
+      rateLimit: { enabled: true, window: 60, max: 3 },
+    });
+
+    const rateLimitedApp = createApp({
+      config: testEnv,
+      auth: rateLimitedAuth,
+    });
+
+    const attempts = [];
+    for (let i = 0; i < 6; i++) {
+      attempts.push(
+        rateLimitedApp.request("/api/auth/request-password-reset", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Origin: "http://127.0.0.1:4000",
+          },
+          body: JSON.stringify({
+            email: "spam-reset@example.com",
+          }),
+        })
+      );
+    }
+
+    const responses = await Promise.all(attempts);
+    const statuses = responses.map((r) => r.status);
+    expect(statuses).toContain(429);
+  });
+
+  it("handles email delivery failure during password reset without leaking account existence", async () => {
+    // Failing email service that throws an error
+    const failingEmailService = {
+      sendEmail: async () => {
+        throw new Error("Email provider error (500): Simulated delivery failure");
+      },
+      sendVerificationEmail: async () => {
+        throw new Error("Email provider error (500): Simulated delivery failure");
+      },
+      sendPasswordResetEmail: async () => {
+        throw new Error("Email provider error (500): Simulated delivery failure");
+      },
+    };
+
+    const authWithFailingEmail = createAuth({
+      db: testDb,
+      env: testEnv,
+      emailService: failingEmailService,
+      rateLimit: { enabled: false },
+    });
+
+    const appWithFailingEmail = createApp({
+      config: testEnv,
+      auth: authWithFailingEmail,
+    });
+
+    // Create user in DB
+    await app.request("/api/auth/sign-up/email", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Origin: "http://127.0.0.1:4000",
+      },
+      body: JSON.stringify({
+        name: "Otto Hahn",
+        email: "otto@example.com",
+        password: "OttoPassword123!",
+      }),
+    });
+
+    // Request reset when email delivery fails
+    const res = await appWithFailingEmail.request("/api/auth/request-password-reset", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Origin: "http://127.0.0.1:4000",
+      },
+      body: JSON.stringify({
+        email: "otto@example.com",
+      }),
+    });
+
+    // Better Auth catches background task errors and returns generic 200 to prevent enumeration
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.status).toBe(true);
   });
 });
