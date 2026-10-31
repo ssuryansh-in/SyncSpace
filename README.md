@@ -62,7 +62,7 @@ The project documentation establishes the engineering specifications, architectu
 ## 4. Scope and Non-Goals (v1)
 
 ### Core Features (P0)
-1. **Workspaces & Roles:** Workspace creation, member management with three roles (`Owner`, `Admin`, `Member`), and strict authorization checks.
+1. **Workspaces & Roles (Milestone 4 Completed):** Workspace lifecycle (creation, listing, details, name updates), member management with three roles (`Owner`, `Admin`, `Member`), direct email addition with enumeration resistance, rate limiting, atomic ownership transfer, and cross-workspace 404 concealment.
 2. **Projects & Kanban Board:** Fixed status columns (`Backlog`, `Todo`, `In Progress`, `Done`), column-scoped task ordering via fractional indexing.
 3. **Tasks & Comments:** Full task lifecycle (create, edit, move, archive, restore), markdown comments with soft deletion, and assignees.
 4. **Optimistic Concurrency:** Task-level `expectedVersion` validation returning `409 VERSION_CONFLICT` upon concurrent conflicting updates.

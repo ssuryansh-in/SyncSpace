@@ -71,6 +71,7 @@ The decisions in this section are mandatory engineering requirements established
 - **Specification Reference:** Sections 4.1, 4.2, 21.
 - **Confirmed Requirement:** Workspace membership grants access to all projects inside that workspace. Roles are strictly `Owner`, `Admin`, and `Member`.
 - **Design Rationale:** Eliminates nested permissions and ACL fragmentation in v1. Workspace boundaries provide clean multi-tenant isolation.
+- **Implementation Status (Milestone 4 Completed):** Workspace lifecycle (`workspaces`) and membership management (`workspace_members`) implemented via `WorkspaceService`, `MembershipService`, and Hono router (`/api/workspaces`). Features atomic creation and initial ownership assignment, active-membership filtering, `404 NOT_FOUND` tenant concealment, owner protection (admins cannot modify or remove owner), enumeration-resistant direct member addition by verified email with rate limiting, and atomic ownership transfer (`POST /api/workspaces/:id/transfer-ownership`) where the new owner receives `owner`, the former owner becomes `admin`, and `workspaces.owner_id` is updated in a single transaction with row locking.
 - **Explicit Non-Goals:** No private projects within workspaces, no project-specific overrides, and no guest/anonymous accounts in v1.
 
 ---
