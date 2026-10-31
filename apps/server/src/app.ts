@@ -2,6 +2,7 @@ import { Hono } from "hono";
 import { healthRoute } from "./routes/health.js";
 import { createReadyRoute } from "./routes/ready.js";
 import { createWorkspaceRoutes } from "./routes/workspaces.js";
+import { createProjectRoutes } from "./routes/projects.js";
 import { createAuth, type Auth } from "./auth/index.js";
 import { db as defaultDb, type Database } from "./db/index.js";
 import type { EnvConfig } from "./config/env.js";
@@ -82,6 +83,13 @@ export function createApp(options: AppOptions = {}): Hono {
       db: targetDb,
       auth: authInstance,
       rateLimit: options.rateLimit,
+    })
+  );
+  app.route(
+    "/api/projects",
+    createProjectRoutes({
+      db: targetDb,
+      auth: authInstance,
     })
   );
   app.route("/health", healthRoute);

@@ -6,6 +6,7 @@ import { createRequireAuth } from "../middleware/auth.js";
 import { createRateLimiter } from "../middleware/rate-limit.js";
 import { WorkspaceService } from "../services/workspace.js";
 import { MembershipService } from "../services/membership.js";
+import { ProjectService } from "../services/project.js";
 
 const createWorkspaceSchema = z.object({
   name: z
@@ -41,6 +42,14 @@ const transferOwnershipSchema = z.object({
   newOwnerId: z
     .string({ required_error: "newOwnerId is required" })
     .uuid("Invalid user ID format"),
+});
+
+const createProjectSchema = z.object({
+  name: z
+    .string({ required_error: "Name is required" })
+    .trim()
+    .min(1, "Name cannot be empty")
+    .max(100, "Name cannot exceed 100 characters"),
 });
 
 const uuidParamSchema = z.string().uuid("Invalid ID format");
@@ -353,6 +362,73 @@ export function createWorkspaceRoutes(options: WorkspaceRouteOptions): Hono {
     });
 
     return c.json(result);
+  });
+
+  // 9. POST /api/workspaces/:workspaceId/projects - Create project & seed fixed columns
+  router.post("/:workspaceId/projects", async (c) => {
+    const user = c.get("user");
+    const workspaceId = c.req.param("workspaceId");
+
+    if (!workspaceId || !uuidParamSchema.safeParse(workspaceId).success) {
+      return c.json(
+        {
+          error: {
+            code: "VALIDATION_ERROR",
+            message: "Invalid workspace ID",
+          },
+        },
+        400
+      );
+    }
+
+    const body = await c.req.json().catch(() => ({}));
+    const parsed = createProjectSchema.safeParse(body);
+
+    if (!parsed.success) {
+      return c.json(
+        {
+          error: {
+            code: "VALIDATION_ERROR",
+            message: "Invalid project payload",
+            details: parsed.error.flatten(),
+          },
+        },
+        400
+      );
+    }
+
+    const result = await ProjectService.createProject(db, {
+      workspaceId,
+      callerId: user.id,
+      name: parsed.data.name,
+    });
+
+    return c.json(result, 201);
+  });
+
+  // 10. GET /api/workspaces/:workspaceId/projects - List workspace projects
+  router.get("/:workspaceId/projects", async (c) => {
+    const user = c.get("user");
+    const workspaceId = c.req.param("workspaceId");
+
+    if (!workspaceId || !uuidParamSchema.safeParse(workspaceId).success) {
+      return c.json(
+        {
+          error: {
+            code: "VALIDATION_ERROR",
+            message: "Invalid workspace ID",
+          },
+        },
+        400
+      );
+    }
+
+    const projectsList = await ProjectService.listProjects(db, {
+      workspaceId,
+      callerId: user.id,
+    });
+
+    return c.json({ projects: projectsList });
   });
 
   return router;
