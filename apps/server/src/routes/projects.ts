@@ -7,6 +7,14 @@ import { ProjectService } from "../services/project.js";
 
 const uuidParamSchema = z.string().uuid("Invalid ID format");
 
+const updateProjectSchema = z.object({
+  name: z
+    .string({ required_error: "Name is required" })
+    .trim()
+    .min(1, "Name cannot be empty")
+    .max(100, "Name cannot exceed 100 characters"),
+});
+
 export interface ProjectRouteOptions {
   db: Database;
   auth: Auth;
@@ -95,6 +103,98 @@ export function createProjectRoutes(options: ProjectRouteOptions): Hono {
     }
 
     return c.json(board);
+  });
+
+  // 3. PATCH /api/projects/:projectId - Rename project (Owner/Admin only)
+  router.patch("/:projectId", async (c) => {
+    const user = c.get("user");
+    const projectId = c.req.param("projectId");
+
+    if (!projectId || !uuidParamSchema.safeParse(projectId).success) {
+      return c.json(
+        {
+          error: {
+            code: "VALIDATION_ERROR",
+            message: "Invalid project ID",
+          },
+        },
+        400
+      );
+    }
+
+    const body = await c.req.json().catch(() => ({}));
+    const parsed = updateProjectSchema.safeParse(body);
+
+    if (!parsed.success) {
+      return c.json(
+        {
+          error: {
+            code: "VALIDATION_ERROR",
+            message: "Invalid project payload",
+            details: parsed.error.flatten(),
+          },
+        },
+        400
+      );
+    }
+
+    const project = await ProjectService.renameProject(db, {
+      projectId,
+      callerId: user.id,
+      name: parsed.data.name,
+    });
+
+    return c.json({ project });
+  });
+
+  // 4. POST /api/projects/:projectId/archive - Archive project (Owner/Admin only)
+  router.post("/:projectId/archive", async (c) => {
+    const user = c.get("user");
+    const projectId = c.req.param("projectId");
+
+    if (!projectId || !uuidParamSchema.safeParse(projectId).success) {
+      return c.json(
+        {
+          error: {
+            code: "VALIDATION_ERROR",
+            message: "Invalid project ID",
+          },
+        },
+        400
+      );
+    }
+
+    const project = await ProjectService.archiveProject(db, {
+      projectId,
+      callerId: user.id,
+    });
+
+    return c.json({ project });
+  });
+
+  // 5. POST /api/projects/:projectId/restore - Restore archived project (Owner/Admin only)
+  router.post("/:projectId/restore", async (c) => {
+    const user = c.get("user");
+    const projectId = c.req.param("projectId");
+
+    if (!projectId || !uuidParamSchema.safeParse(projectId).success) {
+      return c.json(
+        {
+          error: {
+            code: "VALIDATION_ERROR",
+            message: "Invalid project ID",
+          },
+        },
+        400
+      );
+    }
+
+    const project = await ProjectService.restoreProject(db, {
+      projectId,
+      callerId: user.id,
+    });
+
+    return c.json({ project });
   });
 
   return router;

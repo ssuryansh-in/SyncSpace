@@ -113,6 +113,19 @@ describe("Project Management & Board Initialization (Integration - Milestone 5.1
           method: "GET",
           path: "/api/projects/00000000-0000-0000-0000-000000000001/board",
         },
+        {
+          method: "PATCH",
+          path: "/api/projects/00000000-0000-0000-0000-000000000001",
+          body: { name: "Renamed Project" },
+        },
+        {
+          method: "POST",
+          path: "/api/projects/00000000-0000-0000-0000-000000000001/archive",
+        },
+        {
+          method: "POST",
+          path: "/api/projects/00000000-0000-0000-0000-000000000001/restore",
+        },
       ];
 
       for (const ep of endpoints) {
@@ -252,6 +265,25 @@ describe("Project Management & Board Initialization (Integration - Milestone 5.1
         headers: { Cookie: cookie },
       });
       expect(res4.status).toBe(400);
+
+      const res5 = await app.request("/api/projects/not-a-uuid", {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json", Cookie: cookie },
+        body: JSON.stringify({ name: "New Name" }),
+      });
+      expect(res5.status).toBe(400);
+
+      const res6 = await app.request("/api/projects/not-a-uuid/archive", {
+        method: "POST",
+        headers: { Cookie: cookie },
+      });
+      expect(res6.status).toBe(400);
+
+      const res7 = await app.request("/api/projects/not-a-uuid/restore", {
+        method: "POST",
+        headers: { Cookie: cookie },
+      });
+      expect(res7.status).toBe(400);
     });
 
     it("rolls back project creation if an error occurs before transaction commit", async () => {
@@ -496,6 +528,554 @@ describe("Project Management & Board Initialization (Integration - Milestone 5.1
         }
       );
       expect(nonExistentGet.status).toBe(404);
+
+      // 6. User B attempts to rename Project A -> 404 NOT_FOUND
+      const nonMemberPatch = await app.request(`/api/projects/${projA.id}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json", Cookie: userB.cookie },
+        body: JSON.stringify({ name: "Hijacked Project" }),
+      });
+      expect(nonMemberPatch.status).toBe(404);
+      const patchBody = await nonMemberPatch.json();
+      expect(patchBody.error.code).toBe("NOT_FOUND");
+
+      // 7. User B attempts to archive Project A -> 404 NOT_FOUND
+      const nonMemberArchive = await app.request(
+        `/api/projects/${projA.id}/archive`,
+        {
+          method: "POST",
+          headers: { Cookie: userB.cookie },
+        }
+      );
+      expect(nonMemberArchive.status).toBe(404);
+      const archiveBody = await nonMemberArchive.json();
+      expect(archiveBody.error.code).toBe("NOT_FOUND");
+
+      // 8. User B attempts to restore Project A -> 404 NOT_FOUND
+      const nonMemberRestore = await app.request(
+        `/api/projects/${projA.id}/restore`,
+        {
+          method: "POST",
+          headers: { Cookie: userB.cookie },
+        }
+      );
+      expect(nonMemberRestore.status).toBe(404);
+      const restoreBody = await nonMemberRestore.json();
+      expect(restoreBody.error.code).toBe("NOT_FOUND");
+    });
+  });
+
+  describe("Project Rename (Milestone 5.2)", () => {
+    it("allows Owner and Admin to rename an active project with trimmed name", async () => {
+      const owner = await createAndLoginUser("Owner", "rename-owner@example.com");
+      const admin = await createAndLoginUser("Admin", "rename-admin@example.com");
+
+      const wsRes = await app.request("/api/workspaces", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        body: JSON.stringify({ name: "Rename Workspace" }),
+      });
+      const { workspace } = await wsRes.json();
+
+      await testDb.insert(workspaceMembers).values({
+        workspaceId: workspace.id,
+        userId: admin.user.id,
+        role: "admin",
+      });
+
+      const projRes = await app.request(
+        `/api/workspaces/${workspace.id}/projects`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+          body: JSON.stringify({ name: "Original Name" }),
+        }
+      );
+      const { project } = await projRes.json();
+      const initialUpdatedAt = new Date(project.updatedAt).getTime();
+
+      // Ensure timestamp distinction if clock resolution requires it
+      await new Promise((r) => setTimeout(r, 10));
+
+      // 1. Owner renames project with whitespace to verify trimming
+      const renameRes1 = await app.request(`/api/projects/${project.id}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        body: JSON.stringify({ name: "  Owner Renamed Project  " }),
+      });
+      expect(renameRes1.status).toBe(200);
+      const data1 = await renameRes1.json();
+      expect(data1.project.name).toBe("Owner Renamed Project");
+      expect(new Date(data1.project.updatedAt).getTime()).toBeGreaterThanOrEqual(
+        initialUpdatedAt
+      );
+
+      // Verify in DB
+      const [dbProj1] = await testDb
+        .select()
+        .from(projects)
+        .where(eq(projects.id, project.id));
+      expect(dbProj1.name).toBe("Owner Renamed Project");
+
+      await new Promise((r) => setTimeout(r, 10));
+
+      // 2. Admin renames project
+      const renameRes2 = await app.request(`/api/projects/${project.id}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json", Cookie: admin.cookie },
+        body: JSON.stringify({ name: "Admin Renamed Project" }),
+      });
+      expect(renameRes2.status).toBe(200);
+      const data2 = await renameRes2.json();
+      expect(data2.project.name).toBe("Admin Renamed Project");
+    });
+
+    it("rejects regular Member attempts to rename with 403 FORBIDDEN", async () => {
+      const owner = await createAndLoginUser("Owner", "rename-forbid-owner@example.com");
+      const member = await createAndLoginUser("Member", "rename-forbid-member@example.com");
+
+      const wsRes = await app.request("/api/workspaces", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        body: JSON.stringify({ name: "Member Forbidden WS" }),
+      });
+      const { workspace } = await wsRes.json();
+
+      await testDb.insert(workspaceMembers).values({
+        workspaceId: workspace.id,
+        userId: member.user.id,
+        role: "member",
+      });
+
+      const projRes = await app.request(
+        `/api/workspaces/${workspace.id}/projects`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+          body: JSON.stringify({ name: "Untouchable Project" }),
+        }
+      );
+      const { project } = await projRes.json();
+
+      const patchRes = await app.request(`/api/projects/${project.id}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json", Cookie: member.cookie },
+        body: JSON.stringify({ name: "Member Hack Attempt" }),
+      });
+      expect(patchRes.status).toBe(403);
+      const body = await patchRes.json();
+      expect(body.error.code).toBe("FORBIDDEN");
+
+      // Verify DB unchanged
+      const [dbProj] = await testDb
+        .select()
+        .from(projects)
+        .where(eq(projects.id, project.id));
+      expect(dbProj.name).toBe("Untouchable Project");
+    });
+
+    it("rejects invalid rename payloads with 400 VALIDATION_ERROR", async () => {
+      const owner = await createAndLoginUser("Owner", "rename-val-owner@example.com");
+
+      const wsRes = await app.request("/api/workspaces", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        body: JSON.stringify({ name: "Validation WS" }),
+      });
+      const { workspace } = await wsRes.json();
+
+      const projRes = await app.request(
+        `/api/workspaces/${workspace.id}/projects`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+          body: JSON.stringify({ name: "Valid Project" }),
+        }
+      );
+      const { project } = await projRes.json();
+
+      // Empty string
+      const res1 = await app.request(`/api/projects/${project.id}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        body: JSON.stringify({ name: "" }),
+      });
+      expect(res1.status).toBe(400);
+
+      // Whitespace only
+      const res2 = await app.request(`/api/projects/${project.id}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        body: JSON.stringify({ name: "    " }),
+      });
+      expect(res2.status).toBe(400);
+
+      // Exceeds 100 characters
+      const res3 = await app.request(`/api/projects/${project.id}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        body: JSON.stringify({ name: "P".repeat(101) }),
+      });
+      expect(res3.status).toBe(400);
+
+      // Missing name field
+      const res4 = await app.request(`/api/projects/${project.id}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        body: JSON.stringify({}),
+      });
+      expect(res4.status).toBe(400);
+    });
+
+    it("rejects rename of an archived project with 409 PROJECT_ARCHIVED", async () => {
+      const owner = await createAndLoginUser("Owner", "rename-arch-owner@example.com");
+
+      const wsRes = await app.request("/api/workspaces", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        body: JSON.stringify({ name: "Archived Rename WS" }),
+      });
+      const { workspace } = await wsRes.json();
+
+      const projRes = await app.request(
+        `/api/workspaces/${workspace.id}/projects`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+          body: JSON.stringify({ name: "To Be Archived" }),
+        }
+      );
+      const { project } = await projRes.json();
+
+      // Archive project first
+      const archiveRes = await app.request(`/api/projects/${project.id}/archive`, {
+        method: "POST",
+        headers: { Cookie: owner.cookie },
+      });
+      expect(archiveRes.status).toBe(200);
+
+      // Attempt rename on archived project
+      const patchRes = await app.request(`/api/projects/${project.id}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        body: JSON.stringify({ name: "New Name Should Fail" }),
+      });
+      expect(patchRes.status).toBe(409);
+      const body = await patchRes.json();
+      expect(body.error.code).toBe("PROJECT_ARCHIVED");
+    });
+  });
+
+  describe("Project Archival & Restoration Lifecycle (Milestone 5.2)", () => {
+    it("archives a project, excludes it from default listings, and preserves member read access", async () => {
+      const owner = await createAndLoginUser("Owner", "arch-lifecycle-owner@example.com");
+      const member = await createAndLoginUser("Member", "arch-lifecycle-member@example.com");
+
+      const wsRes = await app.request("/api/workspaces", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        body: JSON.stringify({ name: "Lifecycle WS" }),
+      });
+      const { workspace } = await wsRes.json();
+
+      await testDb.insert(workspaceMembers).values({
+        workspaceId: workspace.id,
+        userId: member.user.id,
+        role: "member",
+      });
+
+      const projRes = await app.request(
+        `/api/workspaces/${workspace.id}/projects`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+          body: JSON.stringify({ name: "Project Lifecycle" }),
+        }
+      );
+      const { project } = await projRes.json();
+
+      // 1. Initial listing shows the project
+      const listRes1 = await app.request(
+        `/api/workspaces/${workspace.id}/projects`,
+        {
+          headers: { Cookie: member.cookie },
+        }
+      );
+      const listData1 = await listRes1.json();
+      expect(listData1.projects).toHaveLength(1);
+
+      // 2. Archive the project
+      const archiveRes1 = await app.request(`/api/projects/${project.id}/archive`, {
+        method: "POST",
+        headers: { Cookie: owner.cookie },
+      });
+      expect(archiveRes1.status).toBe(200);
+      const archivedData1 = await archiveRes1.json();
+      expect(archivedData1.project.archivedAt).not.toBeNull();
+      const firstArchivedAt = archivedData1.project.archivedAt;
+      const firstUpdatedAt = archivedData1.project.updatedAt;
+
+      // 3. Project is excluded from default workspace projects listing
+      const listRes2 = await app.request(
+        `/api/workspaces/${workspace.id}/projects`,
+        {
+          headers: { Cookie: member.cookie },
+        }
+      );
+      const listData2 = await listRes2.json();
+      expect(listData2.projects).toHaveLength(0);
+
+      // 4. Workspace members retain read access to project details and board
+      const getRes = await app.request(`/api/projects/${project.id}`, {
+        headers: { Cookie: member.cookie },
+      });
+      expect(getRes.status).toBe(200);
+      const getData = await getRes.json();
+      expect(getData.project.archivedAt).toBe(firstArchivedAt);
+
+      const boardRes = await app.request(`/api/projects/${project.id}/board`, {
+        headers: { Cookie: member.cookie },
+      });
+      expect(boardRes.status).toBe(200);
+      const boardData = await boardRes.json();
+      expect(boardData.columns).toHaveLength(4);
+
+      // 5. Repeated archive call is idempotent and returns 200 without changing updatedAt
+      await new Promise((r) => setTimeout(r, 10));
+      const archiveRes2 = await app.request(`/api/projects/${project.id}/archive`, {
+        method: "POST",
+        headers: { Cookie: owner.cookie },
+      });
+      expect(archiveRes2.status).toBe(200);
+      const archivedData2 = await archiveRes2.json();
+      expect(archivedData2.project.archivedAt).toBe(firstArchivedAt);
+      expect(archivedData2.project.updatedAt).toBe(firstUpdatedAt);
+
+      // 6. Restore the project
+      await new Promise((r) => setTimeout(r, 10));
+      const restoreRes1 = await app.request(`/api/projects/${project.id}/restore`, {
+        method: "POST",
+        headers: { Cookie: owner.cookie },
+      });
+      expect(restoreRes1.status).toBe(200);
+      const restoredData1 = await restoreRes1.json();
+      expect(restoredData1.project.archivedAt).toBeNull();
+      const restoredUpdatedAt = restoredData1.project.updatedAt;
+
+      // 7. Restored project reappears in default listing
+      const listRes3 = await app.request(
+        `/api/workspaces/${workspace.id}/projects`,
+        {
+          headers: { Cookie: member.cookie },
+        }
+      );
+      const listData3 = await listRes3.json();
+      expect(listData3.projects).toHaveLength(1);
+      expect(listData3.projects[0].id).toBe(project.id);
+
+      // 8. Repeated restore call on active project is idempotent without changing updatedAt
+      await new Promise((r) => setTimeout(r, 10));
+      const restoreRes2 = await app.request(`/api/projects/${project.id}/restore`, {
+        method: "POST",
+        headers: { Cookie: owner.cookie },
+      });
+      expect(restoreRes2.status).toBe(200);
+      const restoredData2 = await restoreRes2.json();
+      expect(restoredData2.project.archivedAt).toBeNull();
+      expect(restoredData2.project.updatedAt).toBe(restoredUpdatedAt);
+
+      // 9. Columns and data remain intact
+      const dbCols = await testDb
+        .select()
+        .from(projectColumns)
+        .where(eq(projectColumns.projectId, project.id));
+      expect(dbCols).toHaveLength(4);
+    });
+
+    it("rejects regular Member attempts to archive and restore with 403 FORBIDDEN", async () => {
+      const owner = await createAndLoginUser("Owner", "arch-forbid-owner@example.com");
+      const member = await createAndLoginUser("Member", "arch-forbid-member@example.com");
+
+      const wsRes = await app.request("/api/workspaces", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        body: JSON.stringify({ name: "Member Archive Forbid WS" }),
+      });
+      const { workspace } = await wsRes.json();
+
+      await testDb.insert(workspaceMembers).values({
+        workspaceId: workspace.id,
+        userId: member.user.id,
+        role: "member",
+      });
+
+      const projRes = await app.request(
+        `/api/workspaces/${workspace.id}/projects`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+          body: JSON.stringify({ name: "Protected Project" }),
+        }
+      );
+      const { project } = await projRes.json();
+
+      // Member attempts archive -> 403
+      const archiveRes = await app.request(`/api/projects/${project.id}/archive`, {
+        method: "POST",
+        headers: { Cookie: member.cookie },
+      });
+      expect(archiveRes.status).toBe(403);
+
+      // Owner archives project
+      await app.request(`/api/projects/${project.id}/archive`, {
+        method: "POST",
+        headers: { Cookie: owner.cookie },
+      });
+
+      // Member attempts restore -> 403
+      const restoreRes = await app.request(`/api/projects/${project.id}/restore`, {
+        method: "POST",
+        headers: { Cookie: member.cookie },
+      });
+      expect(restoreRes.status).toBe(403);
+    });
+  });
+
+  describe("Project Lifecycle Concurrency & Races (Milestone 5.2)", () => {
+    it("handles concurrent archive requests cleanly and idempotently", async () => {
+      const owner = await createAndLoginUser("Owner", "concur-arch-owner@example.com");
+
+      const wsRes = await app.request("/api/workspaces", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        body: JSON.stringify({ name: "Concur Arch WS" }),
+      });
+      const { workspace } = await wsRes.json();
+
+      const projRes = await app.request(
+        `/api/workspaces/${workspace.id}/projects`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+          body: JSON.stringify({ name: "Concurrent Arch Project" }),
+        }
+      );
+      const { project } = await projRes.json();
+
+      // Concurrent archive calls
+      const [res1, res2] = await Promise.all([
+        app.request(`/api/projects/${project.id}/archive`, {
+          method: "POST",
+          headers: { Cookie: owner.cookie },
+        }),
+        app.request(`/api/projects/${project.id}/archive`, {
+          method: "POST",
+          headers: { Cookie: owner.cookie },
+        }),
+      ]);
+
+      expect(res1.status).toBe(200);
+      expect(res2.status).toBe(200);
+
+      const [dbProj] = await testDb
+        .select()
+        .from(projects)
+        .where(eq(projects.id, project.id));
+      expect(dbProj.archivedAt).not.toBeNull();
+    });
+
+    it("handles concurrent restore requests cleanly and idempotently", async () => {
+      const owner = await createAndLoginUser("Owner", "concur-res-owner@example.com");
+
+      const wsRes = await app.request("/api/workspaces", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        body: JSON.stringify({ name: "Concur Res WS" }),
+      });
+      const { workspace } = await wsRes.json();
+
+      const projRes = await app.request(
+        `/api/workspaces/${workspace.id}/projects`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+          body: JSON.stringify({ name: "Concurrent Res Project" }),
+        }
+      );
+      const { project } = await projRes.json();
+
+      // Archive first
+      await app.request(`/api/projects/${project.id}/archive`, {
+        method: "POST",
+        headers: { Cookie: owner.cookie },
+      });
+
+      // Concurrent restore calls
+      const [res1, res2] = await Promise.all([
+        app.request(`/api/projects/${project.id}/restore`, {
+          method: "POST",
+          headers: { Cookie: owner.cookie },
+        }),
+        app.request(`/api/projects/${project.id}/restore`, {
+          method: "POST",
+          headers: { Cookie: owner.cookie },
+        }),
+      ]);
+
+      expect(res1.status).toBe(200);
+      expect(res2.status).toBe(200);
+
+      const [dbProj] = await testDb
+        .select()
+        .from(projects)
+        .where(eq(projects.id, project.id));
+      expect(dbProj.archivedAt).toBeNull();
+    });
+
+    it("rejects rename when project is archived concurrently right before rename update", async () => {
+      const owner = await createAndLoginUser("Owner", "concur-race-owner@example.com");
+
+      const wsRes = await app.request("/api/workspaces", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        body: JSON.stringify({ name: "Race WS" }),
+      });
+      const { workspace } = await wsRes.json();
+
+      const projRes = await app.request(
+        `/api/workspaces/${workspace.id}/projects`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+          body: JSON.stringify({ name: "Race Project" }),
+        }
+      );
+      const { project } = await projRes.json();
+
+      // Simulate a concurrent archive that lands right as a rename is attempted
+      // Archive the project
+      await app.request(`/api/projects/${project.id}/archive`, {
+        method: "POST",
+        headers: { Cookie: owner.cookie },
+      });
+
+      // Attempt rename
+      const renameRes = await app.request(`/api/projects/${project.id}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        body: JSON.stringify({ name: "Late Rename" }),
+      });
+
+      expect(renameRes.status).toBe(409);
+      const body = await renameRes.json();
+      expect(body.error.code).toBe("PROJECT_ARCHIVED");
+
+      // Verify DB name was not changed
+      const [dbProj] = await testDb
+        .select()
+        .from(projects)
+        .where(eq(projects.id, project.id));
+      expect(dbProj.name).toBe("Race Project");
     });
   });
 });
