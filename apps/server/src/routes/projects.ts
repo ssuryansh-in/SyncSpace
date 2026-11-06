@@ -236,6 +236,20 @@ export function createProjectRoutes(options: ProjectRouteOptions): Hono {
       );
     }
 
+    const rawKey = c.req.header("Idempotency-Key");
+    const idempotencyKey = rawKey?.trim();
+    if (!idempotencyKey || idempotencyKey.length === 0 || idempotencyKey.length > 128) {
+      return c.json(
+        {
+          error: {
+            code: "VALIDATION_ERROR",
+            message: "Valid Idempotency-Key header is required (1-128 characters)",
+          },
+        },
+        400
+      );
+    }
+
     const body = await c.req.json().catch(() => ({}));
     const parsed = createTaskSchema.safeParse(body);
 
@@ -252,7 +266,7 @@ export function createProjectRoutes(options: ProjectRouteOptions): Hono {
       );
     }
 
-    const task = await TaskService.createTask(db, {
+    const result = await TaskService.createTask(db, {
       projectId,
       callerId: user.id,
       title: parsed.data.title,
@@ -260,9 +274,11 @@ export function createProjectRoutes(options: ProjectRouteOptions): Hono {
       description: parsed.data.description,
       assigneeId: parsed.data.assigneeId,
       dueDate: parsed.data.dueDate,
+      idempotencyKey,
+      requestPath: c.req.path,
     });
 
-    return c.json({ task }, 201);
+    return c.json({ task: result.task }, 201);
   });
 
   // 7. GET /api/projects/:projectId/tasks - List active tasks in project

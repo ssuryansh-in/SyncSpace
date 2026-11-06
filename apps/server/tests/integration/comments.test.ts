@@ -114,7 +114,11 @@ describe("Task Comments Management & Idempotency (Integration - Milestone 6.3)",
 
     const taskRes = await app.request(`/api/projects/${project.id}/tasks`, {
       method: "POST",
-      headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+      headers: {
+        "Content-Type": "application/json",
+        Cookie: owner.cookie,
+        "Idempotency-Key": `comm-seed-task-${crypto.randomUUID()}`,
+      },
       body: JSON.stringify({ title: "Target Task", columnId: columns[0].id }),
     });
     const { task } = await taskRes.json();
@@ -708,7 +712,11 @@ describe("Task Comments Management & Idempotency (Integration - Milestone 6.3)",
       // Create a second task
       const task2Res = await app.request(`/api/projects/${project.id}/tasks`, {
         method: "POST",
-        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        headers: {
+          "Content-Type": "application/json",
+          Cookie: owner.cookie,
+          "Idempotency-Key": `task2-del-${crypto.randomUUID()}`,
+        },
         body: JSON.stringify({ title: "Task 2", columnId: columns[0].id }),
       });
       const { task: task2 } = await task2Res.json();
@@ -1321,7 +1329,11 @@ describe("Task Comments Management & Idempotency (Integration - Milestone 6.3)",
 
       const task2Res = await app.request(`/api/projects/${project.id}/tasks`, {
         method: "POST",
-        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        headers: {
+          "Content-Type": "application/json",
+          Cookie: owner.cookie,
+          "Idempotency-Key": `task2-scope-${crypto.randomUUID()}`,
+        },
         body: JSON.stringify({ title: "Task 2", columnId: columns[0].id }),
       });
       const { task: task2 } = await task2Res.json();
@@ -1489,7 +1501,11 @@ describe("Task Comments Management & Idempotency (Integration - Milestone 6.3)",
       // Create a second task in the same project
       const task2Res = await app.request(`/api/projects/${project.id}/tasks`, {
         method: "POST",
-        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        headers: {
+          "Content-Type": "application/json",
+          Cookie: owner.cookie,
+          "Idempotency-Key": `task2-conc-${crypto.randomUUID()}`,
+        },
         body: JSON.stringify({ title: "Task 2 for cross-task collision", columnId: columns[0].id }),
       });
       const { task: task2 } = await task2Res.json();

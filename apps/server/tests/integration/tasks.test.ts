@@ -4,6 +4,7 @@ import { createApp } from "../../src/app.js";
 import { createAuth } from "../../src/auth/index.js";
 import { createEmailService, clearSentEmailsForTest } from "../../src/services/email.js";
 import { loadEnv } from "../../src/config/env.js";
+import { IdempotencyService } from "../../src/services/idempotency.js";
 import {
   users,
   workspaces,
@@ -11,6 +12,7 @@ import {
   projects,
   projectColumns,
   tasks,
+  idempotencyRecords,
 } from "../../src/db/schema/index.js";
 import { cleanTables, testDb, testSqlClient } from "./setup.js";
 
@@ -119,7 +121,7 @@ describe("Tasks Management, Editing, Movement & Lifecycle (Integration - Milesto
 
       const res = await app.request(`/api/projects/${project.id}/tasks`, {
         method: "POST",
-        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie , "Idempotency-Key": `task-seed-${crypto.randomUUID()}`},
         body: JSON.stringify({
           title: "Initial Task",
           columnId: backlogCol.id,
@@ -164,7 +166,7 @@ describe("Tasks Management, Editing, Movement & Lifecycle (Integration - Milesto
 
       const res = await app.request(`/api/projects/${project.id}/tasks`, {
         method: "POST",
-        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie , "Idempotency-Key": `task-seed-${crypto.randomUUID()}`},
         body: JSON.stringify({
           title: "  Task with Details  ",
           description: "  A thorough description  ",
@@ -187,7 +189,7 @@ describe("Tasks Management, Editing, Movement & Lifecycle (Integration - Milesto
 
       const res = await app.request(`/api/projects/${project.id}/tasks`, {
         method: "POST",
-        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie , "Idempotency-Key": `task-seed-${crypto.randomUUID()}`},
         body: JSON.stringify({
           title: "   ",
           columnId: columns[0].id,
@@ -205,7 +207,7 @@ describe("Tasks Management, Editing, Movement & Lifecycle (Integration - Milesto
       // Invalid project ID
       const res1 = await app.request("/api/projects/not-a-uuid/tasks", {
         method: "POST",
-        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie , "Idempotency-Key": `task-seed-${crypto.randomUUID()}`},
         body: JSON.stringify({
           title: "Test",
           columnId: columns[0].id,
@@ -217,7 +219,7 @@ describe("Tasks Management, Editing, Movement & Lifecycle (Integration - Milesto
       // Invalid column ID
       const res2 = await app.request(`/api/projects/${project.id}/tasks`, {
         method: "POST",
-        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie , "Idempotency-Key": `task-seed-${crypto.randomUUID()}`},
         body: JSON.stringify({
           title: "Test",
           columnId: "invalid-uuid",
@@ -233,7 +235,7 @@ describe("Tasks Management, Editing, Movement & Lifecycle (Integration - Milesto
 
       const res = await app.request(`/api/projects/${project.id}/tasks`, {
         method: "POST",
-        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie , "Idempotency-Key": `task-seed-${crypto.randomUUID()}`},
         body: JSON.stringify({
           title: "Test Task",
           columnId: nonexistentColId,
@@ -259,7 +261,7 @@ describe("Tasks Management, Editing, Movement & Lifecycle (Integration - Milesto
       // Attempt to create a task in Project A using Column from Project B
       const res = await app.request(`/api/projects/${projectA.id}/tasks`, {
         method: "POST",
-        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie , "Idempotency-Key": `task-seed-${crypto.randomUUID()}`},
         body: JSON.stringify({
           title: "Infiltrator Task",
           columnId: columnsB[0].id,
@@ -283,7 +285,7 @@ describe("Tasks Management, Editing, Movement & Lifecycle (Integration - Milesto
 
       const res = await app.request(`/api/projects/${project.id}/tasks`, {
         method: "POST",
-        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie , "Idempotency-Key": `task-seed-${crypto.randomUUID()}`},
         body: JSON.stringify({
           title: "Post-Archive Task",
           columnId: columns[0].id,
@@ -300,7 +302,7 @@ describe("Tasks Management, Editing, Movement & Lifecycle (Integration - Milesto
 
       const res = await app.request(`/api/projects/${project.id}/tasks`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json" , "Idempotency-Key": `task-seed-${crypto.randomUUID()}`},
         body: JSON.stringify({
           title: "Unauth Task",
           columnId: columns[0].id,
@@ -318,7 +320,7 @@ describe("Tasks Management, Editing, Movement & Lifecycle (Integration - Milesto
 
       const res = await app.request(`/api/projects/${project.id}/tasks`, {
         method: "POST",
-        headers: { "Content-Type": "application/json", Cookie: outsider.cookie },
+        headers: { "Content-Type": "application/json", Cookie: outsider.cookie , "Idempotency-Key": `task-seed-${crypto.randomUUID()}`},
         body: JSON.stringify({
           title: "Outsider Task",
           columnId: columns[0].id,
@@ -344,7 +346,7 @@ describe("Tasks Management, Editing, Movement & Lifecycle (Integration - Milesto
       // 1. Admin creates task
       const adminRes = await app.request(`/api/projects/${project.id}/tasks`, {
         method: "POST",
-        headers: { "Content-Type": "application/json", Cookie: admin.cookie },
+        headers: { "Content-Type": "application/json", Cookie: admin.cookie , "Idempotency-Key": `task-seed-${crypto.randomUUID()}`},
         body: JSON.stringify({ title: "Admin Task", columnId: columns[0].id }),
       });
       expect(adminRes.status).toBe(201);
@@ -352,7 +354,7 @@ describe("Tasks Management, Editing, Movement & Lifecycle (Integration - Milesto
       // 2. Member creates task
       const memberRes = await app.request(`/api/projects/${project.id}/tasks`, {
         method: "POST",
-        headers: { "Content-Type": "application/json", Cookie: member.cookie },
+        headers: { "Content-Type": "application/json", Cookie: member.cookie , "Idempotency-Key": `task-seed-${crypto.randomUUID()}`},
         body: JSON.stringify({ title: "Member Task", columnId: columns[1].id }),
       });
       expect(memberRes.status).toBe(201);
@@ -372,7 +374,7 @@ describe("Tasks Management, Editing, Movement & Lifecycle (Integration - Milesto
 
       const res = await app.request(`/api/projects/${project.id}/tasks`, {
         method: "POST",
-        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie , "Idempotency-Key": `task-seed-${crypto.randomUUID()}`},
         body: JSON.stringify({
           title: "Assigned Task",
           columnId: columns[0].id,
@@ -391,7 +393,7 @@ describe("Tasks Management, Editing, Movement & Lifecycle (Integration - Milesto
 
       const res = await app.request(`/api/projects/${project.id}/tasks`, {
         method: "POST",
-        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie , "Idempotency-Key": `task-seed-${crypto.randomUUID()}`},
         body: JSON.stringify({
           title: "Bad Assignee Task",
           columnId: columns[0].id,
@@ -411,7 +413,7 @@ describe("Tasks Management, Editing, Movement & Lifecycle (Integration - Milesto
 
       const res = await app.request(`/api/projects/${project.id}/tasks`, {
         method: "POST",
-        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie , "Idempotency-Key": `task-seed-${crypto.randomUUID()}`},
         body: JSON.stringify({
           title: "Foreign Assignee Task",
           columnId: columns[0].id,
@@ -443,7 +445,7 @@ describe("Tasks Management, Editing, Movement & Lifecycle (Integration - Milesto
 
       const res = await app.request(`/api/projects/${project.id}/tasks`, {
         method: "POST",
-        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie , "Idempotency-Key": `task-seed-${crypto.randomUUID()}`},
         body: JSON.stringify({
           title: "Task with Ex-Member",
           columnId: columns[0].id,
@@ -472,12 +474,12 @@ describe("Tasks Management, Editing, Movement & Lifecycle (Integration - Milesto
       // Create 2 tasks in Project A
       await app.request(`/api/projects/${projA.id}/tasks`, {
         method: "POST",
-        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie , "Idempotency-Key": `task-seed-${crypto.randomUUID()}`},
         body: JSON.stringify({ title: "Task A1", columnId: colsA[0].id }),
       });
       const resA2 = await app.request(`/api/projects/${projA.id}/tasks`, {
         method: "POST",
-        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie , "Idempotency-Key": `task-seed-${crypto.randomUUID()}`},
         body: JSON.stringify({ title: "Task A2", columnId: colsA[1].id }),
       });
       const { task: taskA2 } = await resA2.json();
@@ -485,7 +487,7 @@ describe("Tasks Management, Editing, Movement & Lifecycle (Integration - Milesto
       // Create 1 task in Project B
       await app.request(`/api/projects/${projB.id}/tasks`, {
         method: "POST",
-        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie , "Idempotency-Key": `task-seed-${crypto.randomUUID()}`},
         body: JSON.stringify({ title: "Task B1", columnId: colsB[0].id }),
       });
 
@@ -523,12 +525,12 @@ describe("Tasks Management, Editing, Movement & Lifecycle (Integration - Milesto
 
       await app.request(`/api/projects/${project.id}/tasks`, {
         method: "POST",
-        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie , "Idempotency-Key": `task-seed-${crypto.randomUUID()}`},
         body: JSON.stringify({ title: "Backlog 1", columnId: backlogCol.id }),
       });
       await app.request(`/api/projects/${project.id}/tasks`, {
         method: "POST",
-        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie , "Idempotency-Key": `task-seed-${crypto.randomUUID()}`},
         body: JSON.stringify({ title: "Todo 1", columnId: todoCol.id }),
       });
 
@@ -554,12 +556,12 @@ describe("Tasks Management, Editing, Movement & Lifecycle (Integration - Milesto
 
       await app.request(`/api/projects/${project.id}/tasks`, {
         method: "POST",
-        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie , "Idempotency-Key": `task-seed-${crypto.randomUUID()}`},
         body: JSON.stringify({ title: "Assigned Task", columnId: columns[0].id, assigneeId: member.user.id }),
       });
       await app.request(`/api/projects/${project.id}/tasks`, {
         method: "POST",
-        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie , "Idempotency-Key": `task-seed-${crypto.randomUUID()}`},
         body: JSON.stringify({ title: "Unassigned Task", columnId: columns[0].id }),
       });
 
@@ -631,7 +633,7 @@ describe("Tasks Management, Editing, Movement & Lifecycle (Integration - Milesto
 
       await app.request(`/api/projects/${project.id}/tasks`, {
         method: "POST",
-        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie , "Idempotency-Key": `task-seed-${crypto.randomUUID()}`},
         body: JSON.stringify({ title: "Pre-Archive Task", columnId: columns[0].id }),
       });
 
@@ -658,7 +660,7 @@ describe("Tasks Management, Editing, Movement & Lifecycle (Integration - Milesto
 
       const createRes = await app.request(`/api/projects/${project.id}/tasks`, {
         method: "POST",
-        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie , "Idempotency-Key": `task-seed-${crypto.randomUUID()}`},
         body: JSON.stringify({
           title: "Detailed Task",
           description: "Task description",
@@ -706,7 +708,7 @@ describe("Tasks Management, Editing, Movement & Lifecycle (Integration - Milesto
 
       const createRes = await app.request(`/api/projects/${project.id}/tasks`, {
         method: "POST",
-        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie , "Idempotency-Key": `task-seed-${crypto.randomUUID()}`},
         body: JSON.stringify({ title: "Secret Task", columnId: columns[0].id }),
       });
       const { task } = await createRes.json();
@@ -724,7 +726,7 @@ describe("Tasks Management, Editing, Movement & Lifecycle (Integration - Milesto
 
       const createRes = await app.request(`/api/projects/${project.id}/tasks`, {
         method: "POST",
-        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie , "Idempotency-Key": `task-seed-${crypto.randomUUID()}`},
         body: JSON.stringify({ title: "Archived History Task", columnId: columns[0].id }),
       });
       const { task } = await createRes.json();
@@ -750,7 +752,7 @@ describe("Tasks Management, Editing, Movement & Lifecycle (Integration - Milesto
       const { owner, project, columns } = await setupWorkspaceAndProject();
       const createRes = await app.request(`/api/projects/${project.id}/tasks`, {
         method: "POST",
-        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie , "Idempotency-Key": `task-seed-${crypto.randomUUID()}`},
         body: JSON.stringify({ title: "Initial Title", columnId: columns[0].id }),
       });
       const { task } = await createRes.json();
@@ -792,7 +794,7 @@ describe("Tasks Management, Editing, Movement & Lifecycle (Integration - Milesto
 
       const createRes = await app.request(`/api/projects/${project.id}/tasks`, {
         method: "POST",
-        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie , "Idempotency-Key": `task-seed-${crypto.randomUUID()}`},
         body: JSON.stringify({ title: "Task Before Update", columnId: columns[0].id }),
       });
       const { task } = await createRes.json();
@@ -823,7 +825,7 @@ describe("Tasks Management, Editing, Movement & Lifecycle (Integration - Milesto
 
       const createRes = await app.request(`/api/projects/${project.id}/tasks`, {
         method: "POST",
-        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie , "Idempotency-Key": `task-seed-${crypto.randomUUID()}`},
         body: JSON.stringify({
           title: "Partial Edit Original",
           description: "Keep this description intact",
@@ -862,7 +864,7 @@ describe("Tasks Management, Editing, Movement & Lifecycle (Integration - Milesto
 
       const createRes = await app.request(`/api/projects/${project.id}/tasks`, {
         method: "POST",
-        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie , "Idempotency-Key": `task-seed-${crypto.randomUUID()}`},
         body: JSON.stringify({
           title: "Assigned Task",
           columnId: columns[0].id,
@@ -892,7 +894,7 @@ describe("Tasks Management, Editing, Movement & Lifecycle (Integration - Milesto
 
       const createRes = await app.request(`/api/projects/${project.id}/tasks`, {
         method: "POST",
-        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie , "Idempotency-Key": `task-seed-${crypto.randomUUID()}`},
         body: JSON.stringify({
           title: "Due Date Task",
           columnId: columns[0].id,
@@ -922,7 +924,7 @@ describe("Tasks Management, Editing, Movement & Lifecycle (Integration - Milesto
 
       const createRes = await app.request(`/api/projects/${project.id}/tasks`, {
         method: "POST",
-        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie , "Idempotency-Key": `task-seed-${crypto.randomUUID()}`},
         body: JSON.stringify({ title: "Valid Title", columnId: columns[0].id }),
       });
       const { task } = await createRes.json();
@@ -943,7 +945,7 @@ describe("Tasks Management, Editing, Movement & Lifecycle (Integration - Milesto
 
       const createRes = await app.request(`/api/projects/${project.id}/tasks`, {
         method: "POST",
-        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie , "Idempotency-Key": `task-seed-${crypto.randomUUID()}`},
         body: JSON.stringify({ title: "Valid Title", columnId: columns[0].id }),
       });
       const { task } = await createRes.json();
@@ -964,7 +966,7 @@ describe("Tasks Management, Editing, Movement & Lifecycle (Integration - Milesto
 
       const createRes = await app.request(`/api/projects/${project.id}/tasks`, {
         method: "POST",
-        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie , "Idempotency-Key": `task-seed-${crypto.randomUUID()}`},
         body: JSON.stringify({ title: "Valid Title", columnId: columns[0].id }),
       });
       const { task } = await createRes.json();
@@ -986,7 +988,7 @@ describe("Tasks Management, Editing, Movement & Lifecycle (Integration - Milesto
 
       const createRes = await app.request(`/api/projects/${project.id}/tasks`, {
         method: "POST",
-        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie , "Idempotency-Key": `task-seed-${crypto.randomUUID()}`},
         body: JSON.stringify({ title: "Valid Title", columnId: columns[0].id }),
       });
       const { task } = await createRes.json();
@@ -1015,7 +1017,7 @@ describe("Tasks Management, Editing, Movement & Lifecycle (Integration - Milesto
 
       const createRes = await app.request(`/api/projects/${project.id}/tasks`, {
         method: "POST",
-        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie , "Idempotency-Key": `task-seed-${crypto.randomUUID()}`},
         body: JSON.stringify({ title: "Valid Title", columnId: columns[0].id }),
       });
       const { task } = await createRes.json();
@@ -1047,7 +1049,7 @@ describe("Tasks Management, Editing, Movement & Lifecycle (Integration - Milesto
 
       const createRes = await app.request(`/api/projects/${project.id}/tasks`, {
         method: "POST",
-        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie , "Idempotency-Key": `task-seed-${crypto.randomUUID()}`},
         body: JSON.stringify({ title: "Valid Title", columnId: columns[0].id }),
       });
       const { task } = await createRes.json();
@@ -1068,7 +1070,7 @@ describe("Tasks Management, Editing, Movement & Lifecycle (Integration - Milesto
 
       const createRes = await app.request(`/api/projects/${project.id}/tasks`, {
         method: "POST",
-        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie , "Idempotency-Key": `task-seed-${crypto.randomUUID()}`},
         body: JSON.stringify({ title: "Valid Title", columnId: columns[0].id }),
       });
       const { task } = await createRes.json();
@@ -1090,7 +1092,7 @@ describe("Tasks Management, Editing, Movement & Lifecycle (Integration - Milesto
 
       const createRes = await app.request(`/api/projects/${project.id}/tasks`, {
         method: "POST",
-        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie , "Idempotency-Key": `task-seed-${crypto.randomUUID()}`},
         body: JSON.stringify({ title: "Archived Task", columnId: columns[0].id }),
       });
       const { task } = await createRes.json();
@@ -1117,7 +1119,7 @@ describe("Tasks Management, Editing, Movement & Lifecycle (Integration - Milesto
 
       const createRes = await app.request(`/api/projects/${project.id}/tasks`, {
         method: "POST",
-        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie , "Idempotency-Key": `task-seed-${crypto.randomUUID()}`},
         body: JSON.stringify({ title: "Project Inactive Task", columnId: columns[0].id }),
       });
       const { task } = await createRes.json();
@@ -1145,7 +1147,7 @@ describe("Tasks Management, Editing, Movement & Lifecycle (Integration - Milesto
 
       const createRes = await app.request(`/api/projects/${project.id}/tasks`, {
         method: "POST",
-        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie , "Idempotency-Key": `task-seed-${crypto.randomUUID()}`},
         body: JSON.stringify({
           title: "Identical Title",
           description: "Identical Description",
@@ -1176,7 +1178,7 @@ describe("Tasks Management, Editing, Movement & Lifecycle (Integration - Milesto
 
       const createRes = await app.request(`/api/projects/${project.id}/tasks`, {
         method: "POST",
-        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie , "Idempotency-Key": `task-seed-${crypto.randomUUID()}`},
         body: JSON.stringify({ title: "Secret Task", columnId: columns[0].id }),
       });
       const { task } = await createRes.json();
@@ -1211,7 +1213,7 @@ describe("Tasks Management, Editing, Movement & Lifecycle (Integration - Milesto
 
       const createRes = await app.request(`/api/projects/${project.id}/tasks`, {
         method: "POST",
-        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie , "Idempotency-Key": `task-seed-${crypto.randomUUID()}`},
         body: JSON.stringify({ title: "Race Task", columnId: columns[0].id }),
       });
       const { task } = await createRes.json();
@@ -1253,7 +1255,7 @@ describe("Tasks Management, Editing, Movement & Lifecycle (Integration - Milesto
 
       const createRes = await app.request(`/api/projects/${project.id}/tasks`, {
         method: "POST",
-        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie , "Idempotency-Key": `task-seed-${crypto.randomUUID()}`},
         body: JSON.stringify({ title: "Move Me", columnId: col0.id }),
       });
       const { task } = await createRes.json();
@@ -1293,19 +1295,19 @@ describe("Tasks Management, Editing, Movement & Lifecycle (Integration - Milesto
       // Create 2 existing tasks in col1
       await app.request(`/api/projects/${project.id}/tasks`, {
         method: "POST",
-        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie , "Idempotency-Key": `task-seed-${crypto.randomUUID()}`},
         body: JSON.stringify({ title: "Existing 1", columnId: col1.id }),
       });
       await app.request(`/api/projects/${project.id}/tasks`, {
         method: "POST",
-        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie , "Idempotency-Key": `task-seed-${crypto.randomUUID()}`},
         body: JSON.stringify({ title: "Existing 2", columnId: col1.id }),
       });
 
       // Create task in col0
       const createRes = await app.request(`/api/projects/${project.id}/tasks`, {
         method: "POST",
-        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie , "Idempotency-Key": `task-seed-${crypto.randomUUID()}`},
         body: JSON.stringify({ title: "Task to Move", columnId: col0.id }),
       });
       const { task } = await createRes.json();
@@ -1329,7 +1331,7 @@ describe("Tasks Management, Editing, Movement & Lifecycle (Integration - Milesto
 
       const createRes = await app.request(`/api/projects/${project.id}/tasks`, {
         method: "POST",
-        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie , "Idempotency-Key": `task-seed-${crypto.randomUUID()}`},
         body: JSON.stringify({ title: "Stay in Column", columnId: col0.id }),
       });
       const { task } = await createRes.json();
@@ -1353,7 +1355,7 @@ describe("Tasks Management, Editing, Movement & Lifecycle (Integration - Milesto
 
       const createRes = await app.request(`/api/projects/${project.id}/tasks`, {
         method: "POST",
-        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie , "Idempotency-Key": `task-seed-${crypto.randomUUID()}`},
         body: JSON.stringify({ title: "Stay in Column", columnId: col0.id }),
       });
       const { task } = await createRes.json();
@@ -1375,7 +1377,7 @@ describe("Tasks Management, Editing, Movement & Lifecycle (Integration - Milesto
 
       const createRes = await app.request(`/api/projects/${project.id}/tasks`, {
         method: "POST",
-        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie , "Idempotency-Key": `task-seed-${crypto.randomUUID()}`},
         body: JSON.stringify({ title: "Move Missing Version", columnId: columns[0].id }),
       });
       const { task } = await createRes.json();
@@ -1396,7 +1398,7 @@ describe("Tasks Management, Editing, Movement & Lifecycle (Integration - Milesto
 
       const createRes = await app.request(`/api/projects/${project.id}/tasks`, {
         method: "POST",
-        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie , "Idempotency-Key": `task-seed-${crypto.randomUUID()}`},
         body: JSON.stringify({ title: "Move Invalid Col Format", columnId: columns[0].id }),
       });
       const { task } = await createRes.json();
@@ -1425,7 +1427,7 @@ describe("Tasks Management, Editing, Movement & Lifecycle (Integration - Milesto
 
       const createRes = await app.request(`/api/projects/${project.id}/tasks`, {
         method: "POST",
-        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie , "Idempotency-Key": `task-seed-${crypto.randomUUID()}`},
         body: JSON.stringify({ title: "Cross-Project Move Attempt", columnId: columns[0].id }),
       });
       const { task } = await createRes.json();
@@ -1448,7 +1450,7 @@ describe("Tasks Management, Editing, Movement & Lifecycle (Integration - Milesto
 
       const createRes = await app.request(`/api/projects/${project.id}/tasks`, {
         method: "POST",
-        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie , "Idempotency-Key": `task-seed-${crypto.randomUUID()}`},
         body: JSON.stringify({ title: "Move to Nowhere", columnId: columns[0].id }),
       });
       const { task } = await createRes.json();
@@ -1469,7 +1471,7 @@ describe("Tasks Management, Editing, Movement & Lifecycle (Integration - Milesto
 
       const createRes = await app.request(`/api/projects/${project.id}/tasks`, {
         method: "POST",
-        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie , "Idempotency-Key": `task-seed-${crypto.randomUUID()}`},
         body: JSON.stringify({ title: "Archived Move Task", columnId: columns[0].id }),
       });
       const { task } = await createRes.json();
@@ -1495,7 +1497,7 @@ describe("Tasks Management, Editing, Movement & Lifecycle (Integration - Milesto
 
       const createRes = await app.request(`/api/projects/${project.id}/tasks`, {
         method: "POST",
-        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie , "Idempotency-Key": `task-seed-${crypto.randomUUID()}`},
         body: JSON.stringify({ title: "Archived Project Move", columnId: columns[0].id }),
       });
       const { task } = await createRes.json();
@@ -1523,7 +1525,7 @@ describe("Tasks Management, Editing, Movement & Lifecycle (Integration - Milesto
 
       const createRes = await app.request(`/api/projects/${project.id}/tasks`, {
         method: "POST",
-        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie , "Idempotency-Key": `task-seed-${crypto.randomUUID()}`},
         body: JSON.stringify({ title: "Concealed Move Task", columnId: columns[0].id }),
       });
       const { task } = await createRes.json();
@@ -1544,7 +1546,7 @@ describe("Tasks Management, Editing, Movement & Lifecycle (Integration - Milesto
 
       const createRes = await app.request(`/api/projects/${project.id}/tasks`, {
         method: "POST",
-        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie , "Idempotency-Key": `task-seed-${crypto.randomUUID()}`},
         body: JSON.stringify({ title: "Concurrent Move Task", columnId: columns[0].id }),
       });
       const { task } = await createRes.json();
@@ -1583,7 +1585,7 @@ describe("Tasks Management, Editing, Movement & Lifecycle (Integration - Milesto
 
       const createRes = await app.request(`/api/projects/${project.id}/tasks`, {
         method: "POST",
-        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie , "Idempotency-Key": `task-seed-${crypto.randomUUID()}`},
         body: JSON.stringify({ title: "Task to Archive", columnId: columns[0].id }),
       });
       const { task } = await createRes.json();
@@ -1625,7 +1627,7 @@ describe("Tasks Management, Editing, Movement & Lifecycle (Integration - Milesto
 
       const createRes = await app.request(`/api/projects/${project.id}/tasks`, {
         method: "POST",
-        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie , "Idempotency-Key": `task-seed-${crypto.randomUUID()}`},
         body: JSON.stringify({ title: "Double Archive Task", columnId: columns[0].id }),
       });
       const { task } = await createRes.json();
@@ -1653,7 +1655,7 @@ describe("Tasks Management, Editing, Movement & Lifecycle (Integration - Milesto
 
       const createRes = await app.request(`/api/projects/${project.id}/tasks`, {
         method: "POST",
-        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie , "Idempotency-Key": `task-seed-${crypto.randomUUID()}`},
         body: JSON.stringify({ title: "Task to Restore", columnId: columns[0].id }),
       });
       const { task } = await createRes.json();
@@ -1694,7 +1696,7 @@ describe("Tasks Management, Editing, Movement & Lifecycle (Integration - Milesto
 
       const createRes = await app.request(`/api/projects/${project.id}/tasks`, {
         method: "POST",
-        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie , "Idempotency-Key": `task-seed-${crypto.randomUUID()}`},
         body: JSON.stringify({ title: "Already Active Task", columnId: columns[0].id }),
       });
       const { task } = await createRes.json();
@@ -1717,7 +1719,7 @@ describe("Tasks Management, Editing, Movement & Lifecycle (Integration - Milesto
 
       const createRes = await app.request(`/api/projects/${project.id}/tasks`, {
         method: "POST",
-        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie , "Idempotency-Key": `task-seed-${crypto.randomUUID()}`},
         body: JSON.stringify({ title: "Archive in Inactive Project", columnId: columns[0].id }),
       });
       const { task } = await createRes.json();
@@ -1743,7 +1745,7 @@ describe("Tasks Management, Editing, Movement & Lifecycle (Integration - Milesto
 
       const createRes = await app.request(`/api/projects/${project.id}/tasks`, {
         method: "POST",
-        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie , "Idempotency-Key": `task-seed-${crypto.randomUUID()}`},
         body: JSON.stringify({ title: "Restore in Inactive Project", columnId: columns[0].id }),
       });
       const { task } = await createRes.json();
@@ -1778,7 +1780,7 @@ describe("Tasks Management, Editing, Movement & Lifecycle (Integration - Milesto
 
       const createRes = await app.request(`/api/projects/${project.id}/tasks`, {
         method: "POST",
-        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie , "Idempotency-Key": `task-seed-${crypto.randomUUID()}`},
         body: JSON.stringify({ title: "Concealed Archive Task", columnId: columns[0].id }),
       });
       const { task } = await createRes.json();
@@ -1799,7 +1801,7 @@ describe("Tasks Management, Editing, Movement & Lifecycle (Integration - Milesto
 
       const createRes = await app.request(`/api/projects/${project.id}/tasks`, {
         method: "POST",
-        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie , "Idempotency-Key": `task-seed-${crypto.randomUUID()}`},
         body: JSON.stringify({ title: "Concealed Restore Task", columnId: columns[0].id }),
       });
       const { task } = await createRes.json();
@@ -1832,6 +1834,615 @@ describe("Tasks Management, Editing, Movement & Lifecycle (Integration - Milesto
       expect(restoreRes.status).toBe(400);
       const restoreBody = await restoreRes.json();
       expect(restoreBody.error.code).toBe("VALIDATION_ERROR");
+    });
+  });
+
+  describe("Task Creation Idempotency & Concurrency (POST /api/projects/:projectId/tasks - Milestone 6.4)", () => {
+    // 1. Header Validation
+    it("rejects request missing Idempotency-Key header with 400 VALIDATION_ERROR", async () => {
+      const { owner, project, columns } = await setupWorkspaceAndProject();
+
+      const res = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        body: JSON.stringify({ title: "Valid Task Title", columnId: columns[0].id }),
+      });
+
+      expect(res.status).toBe(400);
+      const body = await res.json();
+      expect(body.error.code).toBe("VALIDATION_ERROR");
+      expect(body.error.message).toContain("Idempotency-Key");
+    });
+
+    it("rejects empty or whitespace-only Idempotency-Key header with 400 VALIDATION_ERROR", async () => {
+      const { owner, project, columns } = await setupWorkspaceAndProject();
+
+      // Empty key
+      const resEmpty = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie, "Idempotency-Key": "" },
+        body: JSON.stringify({ title: "Valid Task Title", columnId: columns[0].id }),
+      });
+      expect(resEmpty.status).toBe(400);
+      expect((await resEmpty.json()).error.code).toBe("VALIDATION_ERROR");
+
+      // Whitespace-only key
+      const resSpace = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie, "Idempotency-Key": "    " },
+        body: JSON.stringify({ title: "Valid Task Title", columnId: columns[0].id }),
+      });
+      expect(resSpace.status).toBe(400);
+      expect((await resSpace.json()).error.code).toBe("VALIDATION_ERROR");
+    });
+
+    it("rejects Idempotency-Key header exceeding 128 characters with 400 VALIDATION_ERROR", async () => {
+      const { owner, project, columns } = await setupWorkspaceAndProject();
+
+      const resLong = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie, "Idempotency-Key": "k".repeat(129) },
+        body: JSON.stringify({ title: "Valid Task Title", columnId: columns[0].id }),
+      });
+
+      expect(resLong.status).toBe(400);
+      const body = await resLong.json();
+      expect(body.error.code).toBe("VALIDATION_ERROR");
+    });
+
+    it("accepts boundary keys of 1 character and 128 characters", async () => {
+      const { owner, project, columns } = await setupWorkspaceAndProject();
+
+      // 1 char boundary
+      const res1 = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie, "Idempotency-Key": "x" },
+        body: JSON.stringify({ title: "Boundary 1 Char", columnId: columns[0].id }),
+      });
+      expect(res1.status).toBe(201);
+      const data1 = await res1.json();
+      expect(data1.task).toBeDefined();
+
+      // 128 chars boundary
+      const res128 = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie, "Idempotency-Key": "z".repeat(128) },
+        body: JSON.stringify({ title: "Boundary 128 Chars", columnId: columns[0].id }),
+      });
+      expect(res128.status).toBe(201);
+      const data128 = await res128.json();
+      expect(data128.task).toBeDefined();
+    });
+
+    // 2. Replay & Conflict
+    it("creates exactly one task when first request with a new key is processed", async () => {
+      const { owner, project, columns } = await setupWorkspaceAndProject();
+
+      const res = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie, "Idempotency-Key": "single-create-key" },
+        body: JSON.stringify({ title: "Single Create Task", columnId: columns[0].id }),
+      });
+      expect(res.status).toBe(201);
+      const data = await res.json();
+      expect(data.task).toBeDefined();
+
+      // Verify in idempotency_records
+      const records = await testDb
+        .select()
+        .from(idempotencyRecords)
+        .where(
+          and(
+            eq(idempotencyRecords.actorId, owner.user.id),
+            eq(idempotencyRecords.idempotencyKey, "single-create-key")
+          )
+        );
+      expect(records).toHaveLength(1);
+      expect(records[0].endpointKey).toBe("tasks:create");
+      expect(records[0].responseStatus).toBe(201);
+    });
+
+    it("replays original result without creating duplicate task when repeated with same key and payload", async () => {
+      const { owner, project, columns } = await setupWorkspaceAndProject();
+      const payload = { title: "Replayed Task", columnId: columns[0].id, description: "Detailed text" };
+
+      // First request
+      const res1 = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie, "Idempotency-Key": "task-replay-key" },
+        body: JSON.stringify(payload),
+      });
+      expect(res1.status).toBe(201);
+      const data1 = await res1.json();
+
+      // Repeated request
+      const res2 = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie, "Idempotency-Key": "task-replay-key" },
+        body: JSON.stringify(payload),
+      });
+      expect(res2.status).toBe(201);
+      const data2 = await res2.json();
+      expect(data2.task.id).toBe(data1.task.id);
+      expect(data2.task.createdAt).toBe(data1.task.createdAt);
+
+      // Verify DB has only 1 task
+      const dbTasks = await testDb.select().from(tasks).where(eq(tasks.projectId, project.id));
+      expect(dbTasks).toHaveLength(1);
+    });
+
+    it("rejects reused key with different title with 409 IDEMPOTENCY_KEY_REUSED", async () => {
+      const { owner, project, columns } = await setupWorkspaceAndProject();
+
+      const res1 = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie, "Idempotency-Key": "diff-title-key" },
+        body: JSON.stringify({ title: "Original Title", columnId: columns[0].id }),
+      });
+      expect(res1.status).toBe(201);
+
+      const res2 = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie, "Idempotency-Key": "diff-title-key" },
+        body: JSON.stringify({ title: "Altered Title", columnId: columns[0].id }),
+      });
+      expect(res2.status).toBe(409);
+      const body = await res2.json();
+      expect(body.error.code).toBe("IDEMPOTENCY_KEY_REUSED");
+
+      // Verify DB still only has 1 task
+      const dbTasks = await testDb.select().from(tasks).where(eq(tasks.projectId, project.id));
+      expect(dbTasks).toHaveLength(1);
+    });
+
+    it("rejects reused key with different columnId with 409 IDEMPOTENCY_KEY_REUSED", async () => {
+      const { owner, project, columns } = await setupWorkspaceAndProject();
+
+      const res1 = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie, "Idempotency-Key": "diff-col-key" },
+        body: JSON.stringify({ title: "Task for Column 0", columnId: columns[0].id }),
+      });
+      expect(res1.status).toBe(201);
+
+      const res2 = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie, "Idempotency-Key": "diff-col-key" },
+        body: JSON.stringify({ title: "Task for Column 0", columnId: columns[1].id }),
+      });
+      expect(res2.status).toBe(409);
+      expect((await res2.json()).error.code).toBe("IDEMPOTENCY_KEY_REUSED");
+    });
+
+    it("rejects reused key with different assigneeId with 409 IDEMPOTENCY_KEY_REUSED", async () => {
+      const { owner, workspace, project, columns } = await setupWorkspaceAndProject();
+      const member = await createAndLoginUser("Assignee Member", "ass-idemp@example.com");
+      await testDb.insert(workspaceMembers).values({
+        workspaceId: workspace.id,
+        userId: member.user.id,
+        role: "member",
+      });
+
+      const res1 = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie, "Idempotency-Key": "diff-ass-key" },
+        body: JSON.stringify({ title: "Task Unassigned", columnId: columns[0].id }),
+      });
+      expect(res1.status).toBe(201);
+
+      const res2 = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie, "Idempotency-Key": "diff-ass-key" },
+        body: JSON.stringify({ title: "Task Unassigned", columnId: columns[0].id, assigneeId: member.user.id }),
+      });
+      expect(res2.status).toBe(409);
+      expect((await res2.json()).error.code).toBe("IDEMPOTENCY_KEY_REUSED");
+    });
+
+    // 3. Scope
+    it("allows different actors to use independent idempotency scopes with the same key name", async () => {
+      const { owner, workspace, project, columns } = await setupWorkspaceAndProject();
+      const member = await createAndLoginUser("Other Member", "other-actor-task@example.com");
+      await testDb.insert(workspaceMembers).values({
+        workspaceId: workspace.id,
+        userId: member.user.id,
+        role: "member",
+      });
+
+      // Owner creates task with key "actor-shared-key"
+      const resOwner = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie, "Idempotency-Key": "actor-shared-key" },
+        body: JSON.stringify({ title: "Owner Task with Shared Key", columnId: columns[0].id }),
+      });
+      expect(resOwner.status).toBe(201);
+
+      // Member creates task with same key "actor-shared-key"
+      const resMember = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: member.cookie, "Idempotency-Key": "actor-shared-key" },
+        body: JSON.stringify({ title: "Member Task with Shared Key", columnId: columns[0].id }),
+      });
+      expect(resMember.status).toBe(201);
+
+      // Both tasks created in DB
+      const dbTasks = await testDb.select().from(tasks).where(eq(tasks.projectId, project.id));
+      expect(dbTasks).toHaveLength(2);
+    });
+
+    it("scopes idempotency keys by project/path so reusing key on different project yields 409 IDEMPOTENCY_KEY_REUSED", async () => {
+      const { owner, workspace, project: proj1, columns: cols1 } = await setupWorkspaceAndProject();
+      const proj2Res = await app.request(`/api/workspaces/${workspace.id}/projects`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        body: JSON.stringify({ name: "Second Project" }),
+      });
+      const { project: proj2, columns: cols2 } = await proj2Res.json();
+
+      // Create task on Project 1
+      const res1 = await app.request(`/api/projects/${proj1.id}/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie, "Idempotency-Key": "cross-proj-key" },
+        body: JSON.stringify({ title: "Task 1", columnId: cols1[0].id }),
+      });
+      expect(res1.status).toBe(201);
+
+      // Attempt to reuse same key on Project 2
+      const res2 = await app.request(`/api/projects/${proj2.id}/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie, "Idempotency-Key": "cross-proj-key" },
+        body: JSON.stringify({ title: "Task 1", columnId: cols2[0].id }),
+      });
+      expect(res2.status).toBe(409);
+      expect((await res2.json()).error.code).toBe("IDEMPOTENCY_KEY_REUSED");
+    });
+
+    // 4. Atomicity
+    it("does not leave a persisted idempotency record or task after a failed transaction", async () => {
+      const { owner, project } = await setupWorkspaceAndProject();
+      const fakeColId = "00000000-0000-0000-0000-000000000099";
+
+      // Attempt creation with invalid column (fails validation in transaction)
+      const res = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie, "Idempotency-Key": "atomic-fail-key" },
+        body: JSON.stringify({ title: "Failed Task", columnId: fakeColId }),
+      });
+      expect(res.status).toBe(400);
+
+      // Verify no task exists
+      const dbTasks = await testDb.select().from(tasks).where(eq(tasks.projectId, project.id));
+      expect(dbTasks).toHaveLength(0);
+
+      // Verify no idempotency record exists
+      const dbRecords = await testDb
+        .select()
+        .from(idempotencyRecords)
+        .where(
+          and(
+            eq(idempotencyRecords.actorId, owner.user.id),
+            eq(idempotencyRecords.idempotencyKey, "atomic-fail-key")
+          )
+        );
+      expect(dbRecords).toHaveLength(0);
+    });
+
+    // 5. Lifecycle & Authorization (The Refined Scenario!)
+    it("replays original task response when retried after project archival (same key and identical payload)", async () => {
+      const { owner, project, columns } = await setupWorkspaceAndProject();
+      const payload = { title: "Archival Replay Task", columnId: columns[0].id };
+
+      // 1. Initial successful creation
+      const res1 = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie, "Idempotency-Key": "arch-replay-key" },
+        body: JSON.stringify(payload),
+      });
+      expect(res1.status).toBe(201);
+      const data1 = await res1.json();
+      expect(data1.task).toBeDefined();
+
+      // 2. Archive the project
+      const archiveRes = await app.request(`/api/projects/${project.id}/archive`, {
+        method: "POST",
+        headers: { Cookie: owner.cookie },
+      });
+      expect(archiveRes.status).toBe(200);
+
+      // 3. Retry the creation request with the same key and identical payload
+      const resRetry = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie, "Idempotency-Key": "arch-replay-key" },
+        body: JSON.stringify(payload),
+      });
+      expect(resRetry.status).toBe(201);
+      const dataRetry = await resRetry.json();
+      expect(dataRetry.task.id).toBe(data1.task.id);
+      expect(dataRetry.task.title).toBe(data1.task.title);
+
+      // 4. Verify no duplicate task exists in DB
+      const dbTasks = await testDb.select().from(tasks).where(eq(tasks.projectId, project.id));
+      expect(dbTasks).toHaveLength(1);
+    });
+
+    it("rejects fresh task creation on an archived project with 409 PROJECT_ARCHIVED", async () => {
+      const { owner, project, columns } = await setupWorkspaceAndProject();
+
+      // Archive project
+      await app.request(`/api/projects/${project.id}/archive`, {
+        method: "POST",
+        headers: { Cookie: owner.cookie },
+      });
+
+      // Attempt fresh task creation with new key
+      const res = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie, "Idempotency-Key": "fresh-arch-key" },
+        body: JSON.stringify({ title: "Fresh Task on Archived Project", columnId: columns[0].id }),
+      });
+      expect(res.status).toBe(409);
+      const body = await res.json();
+      expect(body.error.code).toBe("PROJECT_ARCHIVED");
+
+      // Verify 0 tasks exist
+      const dbTasks = await testDb.select().from(tasks).where(eq(tasks.projectId, project.id));
+      expect(dbTasks).toHaveLength(0);
+    });
+
+    it("returns 404 NOT_FOUND when an expelled/non-member attempts to replay a cached task creation", async () => {
+      const { owner, workspace, project, columns } = await setupWorkspaceAndProject();
+      const member = await createAndLoginUser("Temporary Member", "temp-member@example.com");
+      await testDb.insert(workspaceMembers).values({
+        workspaceId: workspace.id,
+        userId: member.user.id,
+        role: "member",
+      });
+
+      const payload = { title: "Member Seed Task", columnId: columns[0].id };
+
+      // Member creates task
+      const res1 = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: member.cookie, "Idempotency-Key": "member-expel-key" },
+        body: JSON.stringify(payload),
+      });
+      expect(res1.status).toBe(201);
+
+      // Expel member from workspace
+      await app.request(`/api/workspaces/${workspace.id}/members/${member.user.id}`, {
+        method: "DELETE",
+        headers: { Cookie: owner.cookie },
+      });
+
+      // Expelled user retries with the same key and payload
+      const resRetry = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: member.cookie, "Idempotency-Key": "member-expel-key" },
+        body: JSON.stringify(payload),
+      });
+      expect(resRetry.status).toBe(404);
+      expect((await resRetry.json()).error.code).toBe("NOT_FOUND");
+    });
+
+    // 6. Concurrency
+    it("handles two genuinely concurrent HTTP requests with same key and payload (creates exactly 1 task, replays original response)", async () => {
+      const { owner, project, columns } = await setupWorkspaceAndProject();
+      const payload = { title: "Concurrent Unique Task", columnId: columns[0].id };
+
+      // Launch 2 parallel requests
+      const [res1, res2] = await Promise.all([
+        app.request(`/api/projects/${project.id}/tasks`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Cookie: owner.cookie, "Idempotency-Key": "conc-task-dup-key" },
+          body: JSON.stringify(payload),
+        }),
+        app.request(`/api/projects/${project.id}/tasks`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Cookie: owner.cookie, "Idempotency-Key": "conc-task-dup-key" },
+          body: JSON.stringify(payload),
+        }),
+      ]);
+
+      expect(res1.status).toBe(201);
+      expect(res2.status).toBe(201);
+
+      const data1 = await res1.json();
+      const data2 = await res2.json();
+      expect(data1.task.id).toBe(data2.task.id);
+
+      // Exactly 1 task in DB
+      const dbTasks = await testDb.select().from(tasks).where(eq(tasks.projectId, project.id));
+      expect(dbTasks).toHaveLength(1);
+
+      // Exactly 1 idempotency record in DB
+      const records = await testDb
+        .select()
+        .from(idempotencyRecords)
+        .where(
+          and(
+            eq(idempotencyRecords.actorId, owner.user.id),
+            eq(idempotencyRecords.idempotencyKey, "conc-task-dup-key")
+          )
+        );
+      expect(records).toHaveLength(1);
+    });
+
+    it("handles concurrent same-key requests with conflicting payloads (one succeeds, other gets 409 IDEMPOTENCY_KEY_REUSED)", async () => {
+      const { owner, project, columns } = await setupWorkspaceAndProject();
+
+      const [resA, resB] = await Promise.all([
+        app.request(`/api/projects/${project.id}/tasks`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Cookie: owner.cookie, "Idempotency-Key": "conc-task-race-conflict" },
+          body: JSON.stringify({ title: "Payload A", columnId: columns[0].id }),
+        }),
+        app.request(`/api/projects/${project.id}/tasks`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Cookie: owner.cookie, "Idempotency-Key": "conc-task-race-conflict" },
+          body: JSON.stringify({ title: "Payload B (Different)", columnId: columns[0].id }),
+        }),
+      ]);
+
+      const statuses = [resA.status, resB.status].sort();
+      expect(statuses).toEqual([201, 409]);
+
+      const conflictRes = resA.status === 409 ? resA : resB;
+      const conflictBody = await conflictRes.json();
+      expect(conflictBody.error.code).toBe("IDEMPOTENCY_KEY_REUSED");
+
+      // Exactly 1 task created in DB
+      const dbTasks = await testDb.select().from(tasks).where(eq(tasks.projectId, project.id));
+      expect(dbTasks).toHaveLength(1);
+    });
+
+    it("handles concurrent task creation across two different projects with the same idempotency key, recovering from 23505 unique collision", async () => {
+      const { owner, workspace, project: proj1, columns: cols1 } = await setupWorkspaceAndProject();
+      const proj2Res = await app.request(`/api/workspaces/${workspace.id}/projects`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        body: JSON.stringify({ name: "Second Concurrent Project" }),
+      });
+      const { project: proj2, columns: cols2 } = await proj2Res.json();
+
+      const sharedKey = `cross-proj-23505-${crypto.randomUUID()}`;
+      const payload1 = { title: "Task on Project 1", columnId: cols1[0].id };
+      const payload2 = { title: "Task on Project 2", columnId: cols2[0].id };
+
+      let resolveFirstSave: () => void;
+      const firstSaveEntered = new Promise<void>((r) => {
+        resolveFirstSave = r;
+      });
+      let resumeFirstTx: () => void;
+      const allowFirstTxCommit = new Promise<void>((r) => {
+        resumeFirstTx = r;
+      });
+
+      let recoveryCheckCalledWithTopLevelDb = false;
+
+      const origSave = IdempotencyService.save;
+      const origCheck = IdempotencyService.check;
+
+      let saveCount = 0;
+      IdempotencyService.save = async (tx, params) => {
+        if (params.idempotencyKey === sharedKey) {
+          saveCount++;
+          if (saveCount === 1) {
+            // Request 1 inserts the uncommitted idempotency record into its transaction
+            await origSave.call(IdempotencyService, tx, params);
+            // Signal that uncommitted record has been inserted
+            resolveFirstSave();
+            // Hold Request 1 transaction open until Request 2 hits the unique constraint
+            await allowFirstTxCommit;
+            return;
+          }
+        }
+        return origSave.call(IdempotencyService, tx, params);
+      };
+
+      IdempotencyService.check = async (dbOrTx, params) => {
+        if (params.idempotencyKey === sharedKey && dbOrTx === testDb) {
+          recoveryCheckCalledWithTopLevelDb = true;
+        }
+        return origCheck.call(IdempotencyService, dbOrTx, params);
+      };
+
+      try {
+        // 1. Launch Request 1 on Project 1
+        const req1Promise = app.request(`/api/projects/${proj1.id}/tasks`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Cookie: owner.cookie,
+            "Idempotency-Key": sharedKey,
+          },
+          body: JSON.stringify(payload1),
+        });
+
+        // 2. Wait until Request 1 has executed IdempotencyService.save(tx, ...)
+        await firstSaveEntered;
+
+        // 3. Launch Request 2 on Project 2 (different project row lock)
+        const req2Promise = app.request(`/api/projects/${proj2.id}/tasks`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Cookie: owner.cookie,
+            "Idempotency-Key": sharedKey,
+          },
+          body: JSON.stringify(payload2),
+        });
+
+        // 4. Verify through pg_stat_activity that Request 2 is actively blocked on Request 1's uncommitted unique key
+        const startWait = Date.now();
+        let blockedOnUniqueLock = false;
+        while (Date.now() - startWait < 4000) {
+          const rows = await testSqlClient`
+            SELECT pid, wait_event_type, wait_event, pg_blocking_pids(pid) as blocking
+            FROM pg_stat_activity
+            WHERE wait_event_type = 'Lock'
+              AND datname = current_database()
+              AND cardinality(pg_blocking_pids(pid)) > 0
+          `;
+          if (rows.length > 0) {
+            blockedOnUniqueLock = true;
+            break;
+          }
+          await new Promise((r) => setTimeout(r, 20));
+        }
+
+        // 5. Release Request 1 to commit
+        resumeFirstTx!();
+
+        // 6. Await both responses
+        const [res1, res2] = await Promise.all([req1Promise, req2Promise]);
+
+        // Verify that Request 2 was observed waiting on Request 1 in PostgreSQL
+        expect(blockedOnUniqueLock).toBe(true);
+
+        // Verify that the 23505 catch block executed and called IdempotencyService.check using top-level testDb
+        expect(recoveryCheckCalledWithTopLevelDb).toBe(true);
+
+        // Verify HTTP status codes
+        expect(res1.status).toBe(201);
+        expect(res2.status).toBe(409);
+
+        const data1 = await res1.json();
+        const body2 = await res2.json();
+
+        expect(data1.task).toBeDefined();
+        expect(data1.task.projectId).toBe(proj1.id);
+        expect(data1.task.title).toBe("Task on Project 1");
+
+        expect(body2.error.code).toBe("IDEMPOTENCY_KEY_REUSED");
+        expect(body2.error.message).toContain("different request payload");
+
+        // Verify database: Project 1 has exactly 1 task
+        const dbTasksProj1 = await testDb.select().from(tasks).where(eq(tasks.projectId, proj1.id));
+        expect(dbTasksProj1).toHaveLength(1);
+        expect(dbTasksProj1[0].id).toBe(data1.task.id);
+
+        // Verify database: Project 2 has 0 tasks (rolled back completely)
+        const dbTasksProj2 = await testDb.select().from(tasks).where(eq(tasks.projectId, proj2.id));
+        expect(dbTasksProj2).toHaveLength(0);
+
+        // Verify database: exactly 1 idempotency record exists for this actor and key
+        const records = await testDb
+          .select()
+          .from(idempotencyRecords)
+          .where(
+            and(
+              eq(idempotencyRecords.actorId, owner.user.id),
+              eq(idempotencyRecords.idempotencyKey, sharedKey)
+            )
+          );
+        expect(records).toHaveLength(1);
+        expect(records[0].endpointKey).toBe("tasks:create");
+        expect(records[0].responseStatus).toBe(201);
+      } finally {
+        resumeFirstTx?.();
+        IdempotencyService.save = origSave;
+        IdempotencyService.check = origCheck;
+      }
     });
   });
 });

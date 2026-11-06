@@ -2,6 +2,7 @@ import { and, asc, count, eq, isNull } from "drizzle-orm";
 import type { Database } from "../db/index.js";
 import { projectColumns, projects, tasks, workspaceMembers, type Task } from "../db/schema/index.js";
 import { AppError } from "../errors/index.js";
+import { computeRequestHash, IdempotencyService } from "./idempotency.js";
 
 export interface CreateTaskParams {
   projectId: string;
@@ -11,6 +12,8 @@ export interface CreateTaskParams {
   description?: string | undefined;
   assigneeId?: string | null | undefined;
   dueDate?: string | null | undefined;
+  idempotencyKey: string;
+  requestPath: string;
 }
 
 export interface ListTasksParams {
@@ -110,11 +113,14 @@ export class TaskService {
   }
 
   /**
-   * Creates a new task in an active project.
-   * Requires active workspace membership (Owner, Admin, or Member).
-   * Validates that columnId belongs to the project and assigneeId (if provided) is a workspace member.
-   * Rejects task creation in archived projects with 409 PROJECT_ARCHIVED.
-   * Conceals non-existent projects or non-member access with 404 NOT_FOUND.
+   * Creates a new task in a project with full database-persisted idempotency.
+   * - Requires an active project and an active workspace member (caller).
+   * - Acquires exclusive row lock on projects table before idempotency check.
+   * - Replays cached response if matching idempotency record exists (even if project was archived subsequently).
+   * - Rejects conflicting request payload on existing idempotency key with 409 IDEMPOTENCY_KEY_REUSED.
+   * - Rejects fresh task creation in archived projects with 409 PROJECT_ARCHIVED.
+   * - Validates that columnId belongs to the project and assigneeId (if provided) is a workspace member.
+   * - Conceals non-existent projects or non-member access with 404 NOT_FOUND.
    */
   static async createTask(
     db: Database,
@@ -126,101 +132,162 @@ export class TaskService {
       description,
       assigneeId,
       dueDate,
+      idempotencyKey,
+      requestPath,
     }: CreateTaskParams
-  ): Promise<Task> {
-    return await db.transaction(async (tx) => {
-      // 1. Verify project exists
-      const [project] = await tx
-        .select()
-        .from(projects)
-        .where(eq(projects.id, projectId));
+  ): Promise<{ task: Task; replayed: boolean }> {
+    const endpointKey = "tasks:create";
+    const payloadToHash = {
+      title: title.trim(),
+      columnId,
+      description: description?.trim() ?? "",
+      assigneeId: assigneeId ?? null,
+      dueDate: dueDate ?? null,
+    };
+    const requestHash = computeRequestHash("POST", requestPath, payloadToHash);
 
-      if (!project) {
-        throw AppError.notFound("Project not found");
-      }
+    try {
+      return await db.transaction(async (tx) => {
+        // 1. Lock project row
+        const [project] = await (tx
+          .select()
+          .from(projects)
+          .where(eq(projects.id, projectId)) as any).for("update");
 
-      // 2. Verify caller is an active workspace member (404 concealment)
-      const [callerMembership] = await tx
-        .select()
-        .from(workspaceMembers)
-        .where(
-          and(
-            eq(workspaceMembers.workspaceId, project.workspaceId),
-            eq(workspaceMembers.userId, callerId)
-          )
-        );
+        // 2. Verify project exists
+        if (!project) {
+          throw AppError.notFound("Project not found");
+        }
 
-      if (!callerMembership) {
-        throw AppError.notFound("Project not found");
-      }
-
-      // 3. Reject task creation if project is archived
-      if (project.archivedAt !== null) {
-        throw AppError.conflict("PROJECT_ARCHIVED", "Cannot create tasks in an archived project");
-      }
-
-      // 4. Verify column exists and belongs to this project
-      const [column] = await tx
-        .select()
-        .from(projectColumns)
-        .where(eq(projectColumns.id, columnId));
-
-      if (!column) {
-        throw AppError.badRequest("Invalid column ID or column does not exist");
-      }
-
-      if (column.projectId !== projectId) {
-        throw AppError.badRequest("Column does not belong to this project");
-      }
-
-      // 5. If assignee is provided, verify assignee is an active member of this workspace
-      if (assigneeId) {
-        const [assigneeMembership] = await tx
+        // 3. Verify caller is an active workspace member (404 concealment)
+        const [callerMembership] = await tx
           .select()
           .from(workspaceMembers)
           .where(
             and(
               eq(workspaceMembers.workspaceId, project.workspaceId),
-              eq(workspaceMembers.userId, assigneeId)
+              eq(workspaceMembers.userId, callerId)
             )
           );
 
-        if (!assigneeMembership) {
-          throw AppError.badRequest("Assignee must be an active member of the workspace");
+        if (!callerMembership) {
+          throw AppError.notFound("Project not found");
+        }
+
+        // 4. Check idempotency record under project row lock
+        const cached = await IdempotencyService.check(tx, {
+          actorId: callerId,
+          endpointKey,
+          idempotencyKey,
+          requestHash,
+        });
+
+        if (cached) {
+          return {
+            task: (cached.body as { task: Task }).task,
+            replayed: true,
+          };
+        }
+
+        // 5. Fresh creation attempt: reject if project is archived
+        if (project.archivedAt !== null) {
+          throw AppError.conflict("PROJECT_ARCHIVED", "Cannot create tasks in an archived project");
+        }
+
+        // 6. Verify column exists and belongs to this project
+        const [column] = await tx
+          .select()
+          .from(projectColumns)
+          .where(eq(projectColumns.id, columnId));
+
+        if (!column) {
+          throw AppError.badRequest("Invalid column ID or column does not exist");
+        }
+
+        if (column.projectId !== projectId) {
+          throw AppError.badRequest("Column does not belong to this project");
+        }
+
+        // 7. If assignee is provided, verify assignee is an active member of this workspace
+        if (assigneeId) {
+          const [assigneeMembership] = await tx
+            .select()
+            .from(workspaceMembers)
+            .where(
+              and(
+                eq(workspaceMembers.workspaceId, project.workspaceId),
+                eq(workspaceMembers.userId, assigneeId)
+              )
+            );
+
+          if (!assigneeMembership) {
+            throw AppError.badRequest("Assignee must be an active member of the workspace");
+          }
+        }
+
+        // 8. Generate a deterministic initial rank key for ordering
+        const [colTasksCount] = await tx
+          .select({ value: count() })
+          .from(tasks)
+          .where(and(eq(tasks.projectId, projectId), eq(tasks.columnId, columnId)));
+
+        const taskIndex = colTasksCount?.value ?? 0;
+        const rankKey = `a${taskIndex.toString().padStart(5, "0")}`;
+
+        // 9. Insert task row
+        const [task] = await tx
+          .insert(tasks)
+          .values({
+            projectId,
+            columnId,
+            title: title.trim(),
+            description: description?.trim() ?? "",
+            createdBy: callerId,
+            assigneeId: assigneeId ?? null,
+            dueDate: dueDate ? dueDate : null,
+            rankKey,
+            version: 1,
+          })
+          .returning();
+
+        if (!task) {
+          throw new Error("Failed to create task");
+        }
+
+        // 10. Persist idempotency record in the same transaction
+        await IdempotencyService.save(tx, {
+          actorId: callerId,
+          endpointKey,
+          idempotencyKey,
+          requestHash,
+          responseStatus: 201,
+          responseBody: { task },
+        });
+
+        return { task, replayed: false };
+      });
+    } catch (err: any) {
+      // Catch concurrent unique constraint violation on idempotency_records (Postgres code 23505)
+      if (
+        err?.code === "23505" &&
+        (err?.constraint === "idempotency_records_actor_endpoint_key_unique" ||
+          err?.message?.includes("idempotency_records_actor_endpoint_key_unique"))
+      ) {
+        const cached = await IdempotencyService.check(db, {
+          actorId: callerId,
+          endpointKey,
+          idempotencyKey,
+          requestHash,
+        });
+        if (cached) {
+          return {
+            task: (cached.body as { task: Task }).task,
+            replayed: true,
+          };
         }
       }
-
-      // 6. Generate a deterministic initial rank key for ordering
-      const [colTasksCount] = await tx
-        .select({ value: count() })
-        .from(tasks)
-        .where(and(eq(tasks.projectId, projectId), eq(tasks.columnId, columnId)));
-
-      const taskIndex = colTasksCount?.value ?? 0;
-      const rankKey = `a${taskIndex.toString().padStart(5, "0")}`;
-
-      // 7. Insert task row
-      const [task] = await tx
-        .insert(tasks)
-        .values({
-          projectId,
-          columnId,
-          title: title.trim(),
-          description: description?.trim() ?? "",
-          createdBy: callerId,
-          assigneeId: assigneeId ?? null,
-          dueDate: dueDate ? dueDate : null,
-          rankKey,
-          version: 1,
-        })
-        .returning();
-
-      if (!task) {
-        throw new Error("Failed to create task");
-      }
-
-      return task;
-    });
+      throw err;
+    }
   }
 
   /**
