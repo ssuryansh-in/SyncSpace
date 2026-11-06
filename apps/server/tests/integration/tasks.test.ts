@@ -14,7 +14,7 @@ import {
 } from "../../src/db/schema/index.js";
 import { cleanTables, testDb, testSqlClient } from "./setup.js";
 
-describe("Tasks Management & Relational Validation (Integration - Milestone 6.1)", () => {
+describe("Tasks Management, Editing, Movement & Lifecycle (Integration - Milestone 6)", () => {
   const testEnv = loadEnv({
     NODE_ENV: "test",
     PORT: "4000",
@@ -742,6 +742,1096 @@ describe("Tasks Management & Relational Validation (Integration - Milestone 6.1)
       const data = await res.json();
       expect(data.task.id).toBe(task.id);
       expect(data.task.archivedAt).not.toBeNull();
+    });
+  });
+
+  describe("Task Editing (PATCH /api/tasks/:taskId)", () => {
+    it("updates a single field (title) and increments version", async () => {
+      const { owner, project, columns } = await setupWorkspaceAndProject();
+      const createRes = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        body: JSON.stringify({ title: "Initial Title", columnId: columns[0].id }),
+      });
+      const { task } = await createRes.json();
+      expect(task.version).toBe(1);
+
+      const res = await app.request(`/api/tasks/${task.id}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        body: JSON.stringify({ title: "Updated Title", expectedVersion: 1 }),
+      });
+
+      expect(res.status).toBe(200);
+      const data = await res.json();
+      expect(data.task.id).toBe(task.id);
+      expect(data.task.title).toBe("Updated Title");
+      expect(data.task.version).toBe(2);
+      expect(new Date(data.task.updatedAt).getTime()).toBeGreaterThanOrEqual(
+        new Date(task.updatedAt).getTime()
+      );
+
+      // Verify in DB
+      const [dbTask] = await testDb
+        .select()
+        .from(tasks)
+        .where(eq(tasks.id, task.id));
+      expect(dbTask.title).toBe("Updated Title");
+      expect(dbTask.version).toBe(2);
+    });
+
+    it("updates multiple fields (title, description, assigneeId, dueDate)", async () => {
+      const { owner, workspace, project, columns } = await setupWorkspaceAndProject();
+      const member = await createAndLoginUser("Assignee User", "assignee-multi@example.com");
+
+      await testDb.insert(workspaceMembers).values({
+        workspaceId: workspace.id,
+        userId: member.user.id,
+        role: "member",
+      });
+
+      const createRes = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        body: JSON.stringify({ title: "Task Before Update", columnId: columns[0].id }),
+      });
+      const { task } = await createRes.json();
+
+      const res = await app.request(`/api/tasks/${task.id}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        body: JSON.stringify({
+          title: "Comprehensive Update",
+          description: "Updated detailed description",
+          assigneeId: member.user.id,
+          dueDate: "2026-12-31",
+          expectedVersion: 1,
+        }),
+      });
+
+      expect(res.status).toBe(200);
+      const data = await res.json();
+      expect(data.task.title).toBe("Comprehensive Update");
+      expect(data.task.description).toBe("Updated detailed description");
+      expect(data.task.assigneeId).toBe(member.user.id);
+      expect(data.task.dueDate).toBe("2026-12-31");
+      expect(data.task.version).toBe(2);
+    });
+
+    it("leaves omitted fields unchanged during partial edit", async () => {
+      const { owner, project, columns } = await setupWorkspaceAndProject();
+
+      const createRes = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        body: JSON.stringify({
+          title: "Partial Edit Original",
+          description: "Keep this description intact",
+          dueDate: "2026-11-20",
+          columnId: columns[0].id,
+        }),
+      });
+      const { task } = await createRes.json();
+
+      const res = await app.request(`/api/tasks/${task.id}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        body: JSON.stringify({
+          title: "Only Title Modified",
+          expectedVersion: 1,
+        }),
+      });
+
+      expect(res.status).toBe(200);
+      const data = await res.json();
+      expect(data.task.title).toBe("Only Title Modified");
+      expect(data.task.description).toBe("Keep this description intact");
+      expect(data.task.dueDate).toBe("2026-11-20");
+      expect(data.task.version).toBe(2);
+    });
+
+    it("unassigns assignee when assigneeId is explicitly null", async () => {
+      const { owner, workspace, project, columns } = await setupWorkspaceAndProject();
+      const member = await createAndLoginUser("Assigned", "assigned-clear@example.com");
+
+      await testDb.insert(workspaceMembers).values({
+        workspaceId: workspace.id,
+        userId: member.user.id,
+        role: "member",
+      });
+
+      const createRes = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        body: JSON.stringify({
+          title: "Assigned Task",
+          columnId: columns[0].id,
+          assigneeId: member.user.id,
+        }),
+      });
+      const { task } = await createRes.json();
+      expect(task.assigneeId).toBe(member.user.id);
+
+      const res = await app.request(`/api/tasks/${task.id}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        body: JSON.stringify({
+          assigneeId: null,
+          expectedVersion: 1,
+        }),
+      });
+
+      expect(res.status).toBe(200);
+      const data = await res.json();
+      expect(data.task.assigneeId).toBeNull();
+      expect(data.task.version).toBe(2);
+    });
+
+    it("clears dueDate when dueDate is explicitly null", async () => {
+      const { owner, project, columns } = await setupWorkspaceAndProject();
+
+      const createRes = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        body: JSON.stringify({
+          title: "Due Date Task",
+          columnId: columns[0].id,
+          dueDate: "2026-12-25",
+        }),
+      });
+      const { task } = await createRes.json();
+      expect(task.dueDate).toBe("2026-12-25");
+
+      const res = await app.request(`/api/tasks/${task.id}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        body: JSON.stringify({
+          dueDate: null,
+          expectedVersion: 1,
+        }),
+      });
+
+      expect(res.status).toBe(200);
+      const data = await res.json();
+      expect(data.task.dueDate).toBeNull();
+      expect(data.task.version).toBe(2);
+    });
+
+    it("rejects empty title with 400 VALIDATION_ERROR", async () => {
+      const { owner, project, columns } = await setupWorkspaceAndProject();
+
+      const createRes = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        body: JSON.stringify({ title: "Valid Title", columnId: columns[0].id }),
+      });
+      const { task } = await createRes.json();
+
+      const res = await app.request(`/api/tasks/${task.id}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        body: JSON.stringify({ title: "", expectedVersion: 1 }),
+      });
+
+      expect(res.status).toBe(400);
+      const body = await res.json();
+      expect(body.error.code).toBe("VALIDATION_ERROR");
+    });
+
+    it("rejects whitespace-only title with 400 VALIDATION_ERROR", async () => {
+      const { owner, project, columns } = await setupWorkspaceAndProject();
+
+      const createRes = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        body: JSON.stringify({ title: "Valid Title", columnId: columns[0].id }),
+      });
+      const { task } = await createRes.json();
+
+      const res = await app.request(`/api/tasks/${task.id}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        body: JSON.stringify({ title: "     ", expectedVersion: 1 }),
+      });
+
+      expect(res.status).toBe(400);
+      const body = await res.json();
+      expect(body.error.code).toBe("VALIDATION_ERROR");
+    });
+
+    it("rejects invalid date format with 400 VALIDATION_ERROR", async () => {
+      const { owner, project, columns } = await setupWorkspaceAndProject();
+
+      const createRes = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        body: JSON.stringify({ title: "Valid Title", columnId: columns[0].id }),
+      });
+      const { task } = await createRes.json();
+
+      const res = await app.request(`/api/tasks/${task.id}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        body: JSON.stringify({ dueDate: "not-a-date", expectedVersion: 1 }),
+      });
+
+      expect(res.status).toBe(400);
+      const body = await res.json();
+      expect(body.error.code).toBe("VALIDATION_ERROR");
+    });
+
+    it("rejects non-member assignee with 400 VALIDATION_ERROR", async () => {
+      const { owner, project, columns } = await setupWorkspaceAndProject();
+      const outsider = await createAndLoginUser("Non Member", "non-member-assignee@example.com");
+
+      const createRes = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        body: JSON.stringify({ title: "Valid Title", columnId: columns[0].id }),
+      });
+      const { task } = await createRes.json();
+
+      const res = await app.request(`/api/tasks/${task.id}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        body: JSON.stringify({ assigneeId: outsider.user.id, expectedVersion: 1 }),
+      });
+
+      expect(res.status).toBe(400);
+      const body = await res.json();
+      expect(body.error.code).toBe("VALIDATION_ERROR");
+      expect(body.error.message).toContain("active member");
+    });
+
+    it("rejects removed member assignee with 400 VALIDATION_ERROR", async () => {
+      const { owner, workspace, project, columns } = await setupWorkspaceAndProject();
+      const member = await createAndLoginUser("Former Member", "former-member-patch@example.com");
+
+      await testDb.insert(workspaceMembers).values({
+        workspaceId: workspace.id,
+        userId: member.user.id,
+        role: "member",
+      });
+
+      const createRes = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        body: JSON.stringify({ title: "Valid Title", columnId: columns[0].id }),
+      });
+      const { task } = await createRes.json();
+
+      // Remove member from workspace
+      await testDb
+        .delete(workspaceMembers)
+        .where(
+          and(
+            eq(workspaceMembers.workspaceId, workspace.id),
+            eq(workspaceMembers.userId, member.user.id)
+          )
+        );
+
+      const res = await app.request(`/api/tasks/${task.id}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        body: JSON.stringify({ assigneeId: member.user.id, expectedVersion: 1 }),
+      });
+
+      expect(res.status).toBe(400);
+      const body = await res.json();
+      expect(body.error.code).toBe("VALIDATION_ERROR");
+      expect(body.error.message).toContain("active member");
+    });
+
+    it("rejects request missing expectedVersion with 400 VALIDATION_ERROR", async () => {
+      const { owner, project, columns } = await setupWorkspaceAndProject();
+
+      const createRes = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        body: JSON.stringify({ title: "Valid Title", columnId: columns[0].id }),
+      });
+      const { task } = await createRes.json();
+
+      const res = await app.request(`/api/tasks/${task.id}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        body: JSON.stringify({ title: "No Version Provided" }),
+      });
+
+      expect(res.status).toBe(400);
+      const body = await res.json();
+      expect(body.error.code).toBe("VALIDATION_ERROR");
+    });
+
+    it("rejects mismatched expectedVersion with 409 VERSION_CONFLICT returning currentVersion", async () => {
+      const { owner, project, columns } = await setupWorkspaceAndProject();
+
+      const createRes = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        body: JSON.stringify({ title: "Valid Title", columnId: columns[0].id }),
+      });
+      const { task } = await createRes.json();
+
+      const res = await app.request(`/api/tasks/${task.id}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        body: JSON.stringify({ title: "Stale Edit", expectedVersion: 99 }),
+      });
+
+      expect(res.status).toBe(409);
+      const body = await res.json();
+      expect(body.error.code).toBe("VERSION_CONFLICT");
+      expect(body.error.details.currentVersion).toBe(1);
+    });
+
+    it("rejects editing an archived task with 409 TASK_ARCHIVED", async () => {
+      const { owner, project, columns } = await setupWorkspaceAndProject();
+
+      const createRes = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        body: JSON.stringify({ title: "Archived Task", columnId: columns[0].id }),
+      });
+      const { task } = await createRes.json();
+
+      // Soft delete task
+      await testDb
+        .update(tasks)
+        .set({ archivedAt: new Date() })
+        .where(eq(tasks.id, task.id));
+
+      const res = await app.request(`/api/tasks/${task.id}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        body: JSON.stringify({ title: "Trying to edit archived", expectedVersion: 1 }),
+      });
+
+      expect(res.status).toBe(409);
+      const body = await res.json();
+      expect(body.error.code).toBe("TASK_ARCHIVED");
+    });
+
+    it("rejects editing a task in an archived project with 409 PROJECT_ARCHIVED", async () => {
+      const { owner, project, columns } = await setupWorkspaceAndProject();
+
+      const createRes = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        body: JSON.stringify({ title: "Project Inactive Task", columnId: columns[0].id }),
+      });
+      const { task } = await createRes.json();
+
+      // Archive parent project
+      const archiveProjectRes = await app.request(`/api/projects/${project.id}/archive`, {
+        method: "POST",
+        headers: { Cookie: owner.cookie },
+      });
+      expect(archiveProjectRes.status).toBe(200);
+
+      const res = await app.request(`/api/tasks/${task.id}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        body: JSON.stringify({ title: "Edit in Archived Project", expectedVersion: 1 }),
+      });
+
+      expect(res.status).toBe(409);
+      const body = await res.json();
+      expect(body.error.code).toBe("PROJECT_ARCHIVED");
+    });
+
+    it("is an idempotent no-op when fields are identical (preserves version and updatedAt)", async () => {
+      const { owner, project, columns } = await setupWorkspaceAndProject();
+
+      const createRes = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        body: JSON.stringify({
+          title: "Identical Title",
+          description: "Identical Description",
+          columnId: columns[0].id,
+        }),
+      });
+      const { task } = await createRes.json();
+
+      const res = await app.request(`/api/tasks/${task.id}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        body: JSON.stringify({
+          title: "Identical Title",
+          description: "Identical Description",
+          expectedVersion: 1,
+        }),
+      });
+
+      expect(res.status).toBe(200);
+      const data = await res.json();
+      expect(data.task.version).toBe(1);
+      expect(data.task.updatedAt).toBe(task.updatedAt);
+    });
+
+    it("returns 404 NOT_FOUND for non-member editing task (tenant concealment)", async () => {
+      const { owner, project, columns } = await setupWorkspaceAndProject();
+      const outsider = await createAndLoginUser("Outsider", "outsider-patch@example.com");
+
+      const createRes = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        body: JSON.stringify({ title: "Secret Task", columnId: columns[0].id }),
+      });
+      const { task } = await createRes.json();
+
+      const res = await app.request(`/api/tasks/${task.id}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json", Cookie: outsider.cookie },
+        body: JSON.stringify({ title: "Hacked Title", expectedVersion: 1 }),
+      });
+
+      expect(res.status).toBe(404);
+      const body = await res.json();
+      expect(body.error.code).toBe("NOT_FOUND");
+    });
+
+    it("rejects invalid task UUID format with 400 VALIDATION_ERROR", async () => {
+      const { owner } = await setupWorkspaceAndProject();
+
+      const res = await app.request("/api/tasks/not-a-valid-uuid", {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        body: JSON.stringify({ title: "Any Title", expectedVersion: 1 }),
+      });
+
+      expect(res.status).toBe(400);
+      const body = await res.json();
+      expect(body.error.code).toBe("VALIDATION_ERROR");
+    });
+
+    it("handles concurrent edits on the same version (one succeeds, one gets 409 VERSION_CONFLICT)", async () => {
+      const { owner, project, columns } = await setupWorkspaceAndProject();
+
+      const createRes = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        body: JSON.stringify({ title: "Race Task", columnId: columns[0].id }),
+      });
+      const { task } = await createRes.json();
+
+      const [res1, res2] = await Promise.all([
+        app.request(`/api/tasks/${task.id}`, {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+          body: JSON.stringify({ title: "Concurrent Update 1", expectedVersion: 1 }),
+        }),
+        app.request(`/api/tasks/${task.id}`, {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+          body: JSON.stringify({ title: "Concurrent Update 2", expectedVersion: 1 }),
+        }),
+      ]);
+
+      const statuses = [res1.status, res2.status].sort();
+      expect(statuses).toEqual([200, 409]);
+
+      const conflictRes = res1.status === 409 ? res1 : res2;
+      const conflictBody = await conflictRes.json();
+      expect(conflictBody.error.code).toBe("VERSION_CONFLICT");
+
+      // Verify task ends at version 2 in DB
+      const [dbTask] = await testDb
+        .select()
+        .from(tasks)
+        .where(eq(tasks.id, task.id));
+      expect(dbTask.version).toBe(2);
+    });
+  });
+
+  describe("Task Movement (POST /api/tasks/:taskId/move)", () => {
+    it("moves a task across columns, updates rankKey, increments version, and updates updatedAt", async () => {
+      const { owner, project, columns } = await setupWorkspaceAndProject();
+      const col0 = columns[0];
+      const col1 = columns[1];
+
+      const createRes = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        body: JSON.stringify({ title: "Move Me", columnId: col0.id }),
+      });
+      const { task } = await createRes.json();
+      expect(task.columnId).toBe(col0.id);
+      expect(task.version).toBe(1);
+
+      const res = await app.request(`/api/tasks/${task.id}/move`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        body: JSON.stringify({ columnId: col1.id, expectedVersion: 1 }),
+      });
+
+      expect(res.status).toBe(200);
+      const data = await res.json();
+      expect(data.task.id).toBe(task.id);
+      expect(data.task.columnId).toBe(col1.id);
+      expect(data.task.rankKey).toBe("a00000");
+      expect(data.task.version).toBe(2);
+      expect(new Date(data.task.updatedAt).getTime()).toBeGreaterThanOrEqual(
+        new Date(task.updatedAt).getTime()
+      );
+
+      // Verify in DB
+      const [dbTask] = await testDb
+        .select()
+        .from(tasks)
+        .where(eq(tasks.id, task.id));
+      expect(dbTask.columnId).toBe(col1.id);
+      expect(dbTask.version).toBe(2);
+    });
+
+    it("appends deterministic rankKey when destination column already has tasks", async () => {
+      const { owner, project, columns } = await setupWorkspaceAndProject();
+      const col0 = columns[0];
+      const col1 = columns[1];
+
+      // Create 2 existing tasks in col1
+      await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        body: JSON.stringify({ title: "Existing 1", columnId: col1.id }),
+      });
+      await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        body: JSON.stringify({ title: "Existing 2", columnId: col1.id }),
+      });
+
+      // Create task in col0
+      const createRes = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        body: JSON.stringify({ title: "Task to Move", columnId: col0.id }),
+      });
+      const { task } = await createRes.json();
+
+      const res = await app.request(`/api/tasks/${task.id}/move`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        body: JSON.stringify({ columnId: col1.id, expectedVersion: 1 }),
+      });
+
+      expect(res.status).toBe(200);
+      const data = await res.json();
+      expect(data.task.columnId).toBe(col1.id);
+      expect(data.task.rankKey).toBe("a00002");
+      expect(data.task.version).toBe(2);
+    });
+
+    it("is an idempotent no-op when moving to the same column (preserves version and updatedAt)", async () => {
+      const { owner, project, columns } = await setupWorkspaceAndProject();
+      const col0 = columns[0];
+
+      const createRes = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        body: JSON.stringify({ title: "Stay in Column", columnId: col0.id }),
+      });
+      const { task } = await createRes.json();
+
+      const res = await app.request(`/api/tasks/${task.id}/move`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        body: JSON.stringify({ columnId: col0.id, expectedVersion: 1 }),
+      });
+
+      expect(res.status).toBe(200);
+      const data = await res.json();
+      expect(data.task.columnId).toBe(col0.id);
+      expect(data.task.version).toBe(1);
+      expect(data.task.updatedAt).toBe(task.updatedAt);
+    });
+
+    it("rejects same-column move with stale expectedVersion with 409 VERSION_CONFLICT", async () => {
+      const { owner, project, columns } = await setupWorkspaceAndProject();
+      const col0 = columns[0];
+
+      const createRes = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        body: JSON.stringify({ title: "Stay in Column", columnId: col0.id }),
+      });
+      const { task } = await createRes.json();
+
+      const res = await app.request(`/api/tasks/${task.id}/move`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        body: JSON.stringify({ columnId: col0.id, expectedVersion: 99 }),
+      });
+
+      expect(res.status).toBe(409);
+      const body = await res.json();
+      expect(body.error.code).toBe("VERSION_CONFLICT");
+      expect(body.error.details.currentVersion).toBe(1);
+    });
+
+    it("rejects move missing expectedVersion with 400 VALIDATION_ERROR", async () => {
+      const { owner, project, columns } = await setupWorkspaceAndProject();
+
+      const createRes = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        body: JSON.stringify({ title: "Move Missing Version", columnId: columns[0].id }),
+      });
+      const { task } = await createRes.json();
+
+      const res = await app.request(`/api/tasks/${task.id}/move`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        body: JSON.stringify({ columnId: columns[1].id }),
+      });
+
+      expect(res.status).toBe(400);
+      const body = await res.json();
+      expect(body.error.code).toBe("VALIDATION_ERROR");
+    });
+
+    it("rejects invalid destination column UUID format with 400 VALIDATION_ERROR", async () => {
+      const { owner, project, columns } = await setupWorkspaceAndProject();
+
+      const createRes = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        body: JSON.stringify({ title: "Move Invalid Col Format", columnId: columns[0].id }),
+      });
+      const { task } = await createRes.json();
+
+      const res = await app.request(`/api/tasks/${task.id}/move`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        body: JSON.stringify({ columnId: "not-a-valid-uuid", expectedVersion: 1 }),
+      });
+
+      expect(res.status).toBe(400);
+      const body = await res.json();
+      expect(body.error.code).toBe("VALIDATION_ERROR");
+    });
+
+    it("rejects moving task to column belonging to another project with 400 VALIDATION_ERROR", async () => {
+      const { owner, workspace, project, columns } = await setupWorkspaceAndProject();
+
+      // Create a second project in the workspace
+      const proj2Res = await app.request(`/api/workspaces/${workspace.id}/projects`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        body: JSON.stringify({ name: "Second Project" }),
+      });
+      const { columns: proj2Cols } = await proj2Res.json();
+
+      const createRes = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        body: JSON.stringify({ title: "Cross-Project Move Attempt", columnId: columns[0].id }),
+      });
+      const { task } = await createRes.json();
+
+      const res = await app.request(`/api/tasks/${task.id}/move`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        body: JSON.stringify({ columnId: proj2Cols[0].id, expectedVersion: 1 }),
+      });
+
+      expect(res.status).toBe(400);
+      const body = await res.json();
+      expect(body.error.code).toBe("VALIDATION_ERROR");
+      expect(body.error.message).toContain("Column does not belong to this project");
+    });
+
+    it("rejects moving task to nonexistent column with 400 VALIDATION_ERROR", async () => {
+      const { owner, project, columns } = await setupWorkspaceAndProject();
+      const nonExistentCol = "00000000-0000-0000-0000-000000000000";
+
+      const createRes = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        body: JSON.stringify({ title: "Move to Nowhere", columnId: columns[0].id }),
+      });
+      const { task } = await createRes.json();
+
+      const res = await app.request(`/api/tasks/${task.id}/move`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        body: JSON.stringify({ columnId: nonExistentCol, expectedVersion: 1 }),
+      });
+
+      expect(res.status).toBe(400);
+      const body = await res.json();
+      expect(body.error.code).toBe("VALIDATION_ERROR");
+    });
+
+    it("rejects moving an archived task with 409 TASK_ARCHIVED", async () => {
+      const { owner, project, columns } = await setupWorkspaceAndProject();
+
+      const createRes = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        body: JSON.stringify({ title: "Archived Move Task", columnId: columns[0].id }),
+      });
+      const { task } = await createRes.json();
+
+      await testDb
+        .update(tasks)
+        .set({ archivedAt: new Date() })
+        .where(eq(tasks.id, task.id));
+
+      const res = await app.request(`/api/tasks/${task.id}/move`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        body: JSON.stringify({ columnId: columns[1].id, expectedVersion: 1 }),
+      });
+
+      expect(res.status).toBe(409);
+      const body = await res.json();
+      expect(body.error.code).toBe("TASK_ARCHIVED");
+    });
+
+    it("rejects moving task in an archived project with 409 PROJECT_ARCHIVED", async () => {
+      const { owner, project, columns } = await setupWorkspaceAndProject();
+
+      const createRes = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        body: JSON.stringify({ title: "Archived Project Move", columnId: columns[0].id }),
+      });
+      const { task } = await createRes.json();
+
+      const archiveProjectRes = await app.request(`/api/projects/${project.id}/archive`, {
+        method: "POST",
+        headers: { Cookie: owner.cookie },
+      });
+      expect(archiveProjectRes.status).toBe(200);
+
+      const res = await app.request(`/api/tasks/${task.id}/move`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        body: JSON.stringify({ columnId: columns[1].id, expectedVersion: 1 }),
+      });
+
+      expect(res.status).toBe(409);
+      const body = await res.json();
+      expect(body.error.code).toBe("PROJECT_ARCHIVED");
+    });
+
+    it("returns 404 NOT_FOUND for non-member moving task (tenant concealment)", async () => {
+      const { owner, project, columns } = await setupWorkspaceAndProject();
+      const outsider = await createAndLoginUser("Outsider Move", "outsider-move@example.com");
+
+      const createRes = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        body: JSON.stringify({ title: "Concealed Move Task", columnId: columns[0].id }),
+      });
+      const { task } = await createRes.json();
+
+      const res = await app.request(`/api/tasks/${task.id}/move`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: outsider.cookie },
+        body: JSON.stringify({ columnId: columns[1].id, expectedVersion: 1 }),
+      });
+
+      expect(res.status).toBe(404);
+      const body = await res.json();
+      expect(body.error.code).toBe("NOT_FOUND");
+    });
+
+    it("handles concurrent moves on the same version (one succeeds, one gets 409 VERSION_CONFLICT)", async () => {
+      const { owner, project, columns } = await setupWorkspaceAndProject();
+
+      const createRes = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        body: JSON.stringify({ title: "Concurrent Move Task", columnId: columns[0].id }),
+      });
+      const { task } = await createRes.json();
+
+      const [res1, res2] = await Promise.all([
+        app.request(`/api/tasks/${task.id}/move`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+          body: JSON.stringify({ columnId: columns[1].id, expectedVersion: 1 }),
+        }),
+        app.request(`/api/tasks/${task.id}/move`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+          body: JSON.stringify({ columnId: columns[2].id, expectedVersion: 1 }),
+        }),
+      ]);
+
+      const statuses = [res1.status, res2.status].sort();
+      expect(statuses).toEqual([200, 409]);
+
+      const conflictRes = res1.status === 409 ? res1 : res2;
+      const conflictBody = await conflictRes.json();
+      expect(conflictBody.error.code).toBe("VERSION_CONFLICT");
+
+      const [dbTask] = await testDb
+        .select()
+        .from(tasks)
+        .where(eq(tasks.id, task.id));
+      expect(dbTask.version).toBe(2);
+    });
+  });
+
+  describe("Task Lifecycle (POST /api/tasks/:taskId/archive & /restore)", () => {
+    it("archives an active task, increments version, updates updatedAt, and hides from project list", async () => {
+      const { owner, project, columns } = await setupWorkspaceAndProject();
+
+      const createRes = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        body: JSON.stringify({ title: "Task to Archive", columnId: columns[0].id }),
+      });
+      const { task } = await createRes.json();
+      expect(task.archivedAt).toBeNull();
+      expect(task.version).toBe(1);
+
+      const res = await app.request(`/api/tasks/${task.id}/archive`, {
+        method: "POST",
+        headers: { Cookie: owner.cookie },
+      });
+
+      expect(res.status).toBe(200);
+      const data = await res.json();
+      expect(data.task.id).toBe(task.id);
+      expect(data.task.archivedAt).not.toBeNull();
+      expect(data.task.version).toBe(2);
+      expect(new Date(data.task.updatedAt).getTime()).toBeGreaterThanOrEqual(
+        new Date(task.updatedAt).getTime()
+      );
+
+      // Verify excluded from default project task listing
+      const listRes = await app.request(`/api/projects/${project.id}/tasks`, {
+        headers: { Cookie: owner.cookie },
+      });
+      const listData = await listRes.json();
+      expect(listData.tasks.some((t: any) => t.id === task.id)).toBe(false);
+
+      // Verify still retrievable via GET /api/tasks/:taskId for history inspection
+      const getRes = await app.request(`/api/tasks/${task.id}`, {
+        headers: { Cookie: owner.cookie },
+      });
+      expect(getRes.status).toBe(200);
+      const getData = await getRes.json();
+      expect(getData.task.archivedAt).not.toBeNull();
+    });
+
+    it("is an idempotent no-op when archiving an already archived task (preserves version and updatedAt)", async () => {
+      const { owner, project, columns } = await setupWorkspaceAndProject();
+
+      const createRes = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        body: JSON.stringify({ title: "Double Archive Task", columnId: columns[0].id }),
+      });
+      const { task } = await createRes.json();
+
+      const res1 = await app.request(`/api/tasks/${task.id}/archive`, {
+        method: "POST",
+        headers: { Cookie: owner.cookie },
+      });
+      const data1 = await res1.json();
+      expect(data1.task.version).toBe(2);
+
+      const res2 = await app.request(`/api/tasks/${task.id}/archive`, {
+        method: "POST",
+        headers: { Cookie: owner.cookie },
+      });
+      expect(res2.status).toBe(200);
+      const data2 = await res2.json();
+      expect(data2.task.version).toBe(2);
+      expect(data2.task.archivedAt).toBe(data1.task.archivedAt);
+      expect(data2.task.updatedAt).toBe(data1.task.updatedAt);
+    });
+
+    it("restores an archived task, increments version, updates updatedAt, and reappears in project list", async () => {
+      const { owner, project, columns } = await setupWorkspaceAndProject();
+
+      const createRes = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        body: JSON.stringify({ title: "Task to Restore", columnId: columns[0].id }),
+      });
+      const { task } = await createRes.json();
+
+      // Archive task first
+      const archiveRes = await app.request(`/api/tasks/${task.id}/archive`, {
+        method: "POST",
+        headers: { Cookie: owner.cookie },
+      });
+      const { task: archivedTask } = await archiveRes.json();
+      expect(archivedTask.version).toBe(2);
+
+      // Restore task
+      const restoreRes = await app.request(`/api/tasks/${task.id}/restore`, {
+        method: "POST",
+        headers: { Cookie: owner.cookie },
+      });
+
+      expect(restoreRes.status).toBe(200);
+      const data = await restoreRes.json();
+      expect(data.task.id).toBe(task.id);
+      expect(data.task.archivedAt).toBeNull();
+      expect(data.task.version).toBe(3);
+      expect(new Date(data.task.updatedAt).getTime()).toBeGreaterThanOrEqual(
+        new Date(archivedTask.updatedAt).getTime()
+      );
+
+      // Verify reappears in project task listing
+      const listRes = await app.request(`/api/projects/${project.id}/tasks`, {
+        headers: { Cookie: owner.cookie },
+      });
+      const listData = await listRes.json();
+      expect(listData.tasks.some((t: any) => t.id === task.id)).toBe(true);
+    });
+
+    it("is an idempotent no-op when restoring an already active task (preserves version and updatedAt)", async () => {
+      const { owner, project, columns } = await setupWorkspaceAndProject();
+
+      const createRes = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        body: JSON.stringify({ title: "Already Active Task", columnId: columns[0].id }),
+      });
+      const { task } = await createRes.json();
+      expect(task.version).toBe(1);
+
+      const res = await app.request(`/api/tasks/${task.id}/restore`, {
+        method: "POST",
+        headers: { Cookie: owner.cookie },
+      });
+
+      expect(res.status).toBe(200);
+      const data = await res.json();
+      expect(data.task.version).toBe(1);
+      expect(data.task.archivedAt).toBeNull();
+      expect(data.task.updatedAt).toBe(task.updatedAt);
+    });
+
+    it("rejects archiving a task in an archived project with 409 PROJECT_ARCHIVED", async () => {
+      const { owner, project, columns } = await setupWorkspaceAndProject();
+
+      const createRes = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        body: JSON.stringify({ title: "Archive in Inactive Project", columnId: columns[0].id }),
+      });
+      const { task } = await createRes.json();
+
+      const archiveProjectRes = await app.request(`/api/projects/${project.id}/archive`, {
+        method: "POST",
+        headers: { Cookie: owner.cookie },
+      });
+      expect(archiveProjectRes.status).toBe(200);
+
+      const res = await app.request(`/api/tasks/${task.id}/archive`, {
+        method: "POST",
+        headers: { Cookie: owner.cookie },
+      });
+
+      expect(res.status).toBe(409);
+      const body = await res.json();
+      expect(body.error.code).toBe("PROJECT_ARCHIVED");
+    });
+
+    it("rejects restoring a task in an archived project with 409 PROJECT_ARCHIVED", async () => {
+      const { owner, project, columns } = await setupWorkspaceAndProject();
+
+      const createRes = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        body: JSON.stringify({ title: "Restore in Inactive Project", columnId: columns[0].id }),
+      });
+      const { task } = await createRes.json();
+
+      // Archive task while project is still active
+      const archiveTaskRes = await app.request(`/api/tasks/${task.id}/archive`, {
+        method: "POST",
+        headers: { Cookie: owner.cookie },
+      });
+      expect(archiveTaskRes.status).toBe(200);
+
+      // Now archive project
+      const archiveProjectRes = await app.request(`/api/projects/${project.id}/archive`, {
+        method: "POST",
+        headers: { Cookie: owner.cookie },
+      });
+      expect(archiveProjectRes.status).toBe(200);
+
+      const res = await app.request(`/api/tasks/${task.id}/restore`, {
+        method: "POST",
+        headers: { Cookie: owner.cookie },
+      });
+
+      expect(res.status).toBe(409);
+      const body = await res.json();
+      expect(body.error.code).toBe("PROJECT_ARCHIVED");
+    });
+
+    it("returns 404 NOT_FOUND for non-member archiving task (tenant concealment)", async () => {
+      const { owner, project, columns } = await setupWorkspaceAndProject();
+      const outsider = await createAndLoginUser("Outsider Archive", "outsider-archive@example.com");
+
+      const createRes = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        body: JSON.stringify({ title: "Concealed Archive Task", columnId: columns[0].id }),
+      });
+      const { task } = await createRes.json();
+
+      const res = await app.request(`/api/tasks/${task.id}/archive`, {
+        method: "POST",
+        headers: { Cookie: outsider.cookie },
+      });
+
+      expect(res.status).toBe(404);
+      const body = await res.json();
+      expect(body.error.code).toBe("NOT_FOUND");
+    });
+
+    it("returns 404 NOT_FOUND for non-member restoring task (tenant concealment)", async () => {
+      const { owner, project, columns } = await setupWorkspaceAndProject();
+      const outsider = await createAndLoginUser("Outsider Restore", "outsider-restore@example.com");
+
+      const createRes = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        body: JSON.stringify({ title: "Concealed Restore Task", columnId: columns[0].id }),
+      });
+      const { task } = await createRes.json();
+
+      const res = await app.request(`/api/tasks/${task.id}/restore`, {
+        method: "POST",
+        headers: { Cookie: outsider.cookie },
+      });
+
+      expect(res.status).toBe(404);
+      const body = await res.json();
+      expect(body.error.code).toBe("NOT_FOUND");
+    });
+
+    it("rejects invalid task UUID format for archive and restore with 400 VALIDATION_ERROR", async () => {
+      const { owner } = await setupWorkspaceAndProject();
+
+      const archiveRes = await app.request("/api/tasks/not-a-valid-uuid/archive", {
+        method: "POST",
+        headers: { Cookie: owner.cookie },
+      });
+      expect(archiveRes.status).toBe(400);
+      const archiveBody = await archiveRes.json();
+      expect(archiveBody.error.code).toBe("VALIDATION_ERROR");
+
+      const restoreRes = await app.request("/api/tasks/not-a-valid-uuid/restore", {
+        method: "POST",
+        headers: { Cookie: owner.cookie },
+      });
+      expect(restoreRes.status).toBe(400);
+      const restoreBody = await restoreRes.json();
+      expect(restoreBody.error.code).toBe("VALIDATION_ERROR");
     });
   });
 });
