@@ -63,7 +63,7 @@ The project documentation establishes the engineering specifications, architectu
 
 ### Core Features (P0)
 1. **Workspaces & Roles (Milestone 4 Completed):** Workspace lifecycle (creation, listing, details, name updates), member management with three roles (`Owner`, `Admin`, `Member`), direct email addition with enumeration resistance, rate limiting, atomic ownership transfer, and cross-workspace 404 concealment.
-2. **Projects & Kanban Board:** Fixed status columns (`Backlog`, `Todo`, `In Progress`, `Done`), column-scoped task ordering via fractional indexing.
+2. **Projects & Kanban Board (Milestone 5 Completed):** Project lifecycle management (creation, listing, details retrieval, board retrieval, rename, archive, restore), four fixed canonical status columns (`Backlog`, `Todo`, `In Progress`, `Done` at positions 0–3) seeded atomically during project creation, workspace-scoped authorization (`Owner` and `Admin` lifecycle management, `Member` creation and view permissions), strict `404 NOT_FOUND` tenant concealment for non-members, and automatic exclusion of archived projects from default workspace listings.
 3. **Tasks & Comments:** Full task lifecycle (create, edit, move, archive, restore), markdown comments with soft deletion, and assignees.
 4. **Optimistic Concurrency:** Task-level `expectedVersion` validation returning `409 VERSION_CONFLICT` upon concurrent conflicting updates.
 5. **Unified Event Log:** Canonical `project_events` table acting as audit history, catch-up feed, and notification source.

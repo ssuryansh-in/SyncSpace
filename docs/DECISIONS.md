@@ -64,6 +64,7 @@ The decisions in this section are mandatory engineering requirements established
 - **Specification Reference:** Sections 3.2, 6.5, 7.4, 21.
 - **Confirmed Requirement:** In normal product workflows, tasks and projects are archived via `archived_at TIMESTAMPTZ`, and comments are soft-deleted via `deleted_at TIMESTAMPTZ`. Hard deletion is excluded from v1.
 - **Design Rationale:** Preserves audit trail integrity in `project_events`. Hard-deleting rows would leave broken foreign keys or phantom references in historical event streams.
+- **Implementation Status (Milestone 5 Completed):** Project archival implemented via `archived_at TIMESTAMPTZ` on `projects`. Endpoints `POST /api/projects/:projectId/archive` and `POST /api/projects/:projectId/restore` perform idempotent updates returning the current state without advancing `updatedAt` on repeat calls. Archived projects are excluded from default workspace listings while remaining accessible for read-only history inspection by members. Mutations against archived projects (e.g. `PATCH /api/projects/:projectId`) are strictly rejected with `409 PROJECT_ARCHIVED`. Hard deletion is prohibited.
 
 ---
 
@@ -72,6 +73,7 @@ The decisions in this section are mandatory engineering requirements established
 - **Confirmed Requirement:** Workspace membership grants access to all projects inside that workspace. Roles are strictly `Owner`, `Admin`, and `Member`.
 - **Design Rationale:** Eliminates nested permissions and ACL fragmentation in v1. Workspace boundaries provide clean multi-tenant isolation.
 - **Implementation Status (Milestone 4 Completed):** Workspace lifecycle (`workspaces`) and membership management (`workspace_members`) implemented via `WorkspaceService`, `MembershipService`, and Hono router (`/api/workspaces`). Features atomic creation and initial ownership assignment, active-membership filtering, `404 NOT_FOUND` tenant concealment, owner protection (admins cannot modify or remove owner), enumeration-resistant direct member addition by verified email with rate limiting, and atomic ownership transfer (`POST /api/workspaces/:id/transfer-ownership`) where the new owner receives `owner`, the former owner becomes `admin`, and `workspaces.owner_id` is updated in a single transaction with row locking.
+- **Implementation Status (Milestone 5 Completed):** Project and board endpoints (`/api/workspaces/:workspaceId/projects` and `/api/projects/:projectId`) enforce workspace-scoped authorization. Role permissions follow Section 4.2: `Owner` and `Admin` may create, view, rename, archive, and restore projects; regular `Member` may create and view projects but receives `403 FORBIDDEN` for lifecycle mutations (`PATCH`, `/archive`, `/restore`). Non-members consistently receive `404 NOT_FOUND` across all project and board endpoints, concealing resource existence. Access is dynamically revoked immediately upon member removal or role demotion.
 - **Explicit Non-Goals:** No private projects within workspaces, no project-specific overrides, and no guest/anonymous accounts in v1.
 
 ---
@@ -80,6 +82,7 @@ The decisions in this section are mandatory engineering requirements established
 - **Specification Reference:** Sections 6.3, 9.5, 21.
 - **Confirmed Requirement:** A task's status is represented exclusively by its `column_id`. There is no separate `status` column in the `tasks` table. Fixed columns in v1 are `Backlog`, `Todo`, `In Progress`, and `Done`.
 - **Design Rationale:** Having both a `column_id` and a `status` enum introduces the risk of state disagreement and desynchronization bugs.
+- **Implementation Status (Milestone 5 Completed):** Projects are seeded with exactly four canonical status columns upon creation (`Backlog` at position 0, `Todo` at position 1, `In Progress` at position 2, `Done` at position 3). Column seeding occurs atomically within the project creation database transaction. Database unique constraints on `(project_id, position)` and `(project_id, name)` ensure deterministic column ordering and prevent duplicates.
 
 ---
 

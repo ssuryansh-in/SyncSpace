@@ -1078,5 +1078,360 @@ describe("Project Management & Board Initialization (Integration - Milestone 5.1
       expect(dbProj.name).toBe("Race Project");
     });
   });
+
+  describe("Tenant Isolation, Dynamic Revocation & Concurrency (Milestone 5.3)", () => {
+    it("immediately revokes project and board access with 404 NOT_FOUND upon member removal", async () => {
+      const owner = await createAndLoginUser("Owner", "revoc-owner@example.com");
+      const member = await createAndLoginUser("Member", "revoc-member@example.com");
+
+      // 1. Owner creates workspace and project
+      const wsRes = await app.request("/api/workspaces", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        body: JSON.stringify({ name: "Revocation WS" }),
+      });
+      const { workspace } = await wsRes.json();
+
+      const projRes = await app.request(`/api/workspaces/${workspace.id}/projects`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        body: JSON.stringify({ name: "Revocation Project" }),
+      });
+      const { project } = await projRes.json();
+
+      // 2. Add member to workspace
+      await testDb.insert(workspaceMembers).values({
+        workspaceId: workspace.id,
+        userId: member.user.id,
+        role: "member",
+      });
+
+      // 3. Verify member can access project details and board
+      const preCheckProj = await app.request(`/api/projects/${project.id}`, {
+        headers: { Cookie: member.cookie },
+      });
+      expect(preCheckProj.status).toBe(200);
+
+      const preCheckBoard = await app.request(`/api/projects/${project.id}/board`, {
+        headers: { Cookie: member.cookie },
+      });
+      expect(preCheckBoard.status).toBe(200);
+
+      // 4. Remove user from workspace via DELETE /api/workspaces/:workspaceId/members/:memberId
+      const removeRes = await app.request(
+        `/api/workspaces/${workspace.id}/members/${member.user.id}`,
+        {
+          method: "DELETE",
+          headers: { Cookie: owner.cookie },
+        }
+      );
+      expect(removeRes.status).toBe(200);
+
+      // 5. Without logging out, verify all project endpoints return 404 NOT_FOUND
+      // a. Listing projects
+      const postList = await app.request(`/api/workspaces/${workspace.id}/projects`, {
+        headers: { Cookie: member.cookie },
+      });
+      expect(postList.status).toBe(404);
+      expect((await postList.json()).error.code).toBe("NOT_FOUND");
+
+      // b. Project details
+      const postGet = await app.request(`/api/projects/${project.id}`, {
+        headers: { Cookie: member.cookie },
+      });
+      expect(postGet.status).toBe(404);
+      expect((await postGet.json()).error.code).toBe("NOT_FOUND");
+
+      // c. Board columns
+      const postBoard = await app.request(`/api/projects/${project.id}/board`, {
+        headers: { Cookie: member.cookie },
+      });
+      expect(postBoard.status).toBe(404);
+      expect((await postBoard.json()).error.code).toBe("NOT_FOUND");
+
+      // d. Project rename
+      const postRename = await app.request(`/api/projects/${project.id}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json", Cookie: member.cookie },
+        body: JSON.stringify({ name: "Attempted Post-Removal Rename" }),
+      });
+      expect(postRename.status).toBe(404);
+      expect((await postRename.json()).error.code).toBe("NOT_FOUND");
+
+      // e. Project archive
+      const postArchive = await app.request(`/api/projects/${project.id}/archive`, {
+        method: "POST",
+        headers: { Cookie: member.cookie },
+      });
+      expect(postArchive.status).toBe(404);
+      expect((await postArchive.json()).error.code).toBe("NOT_FOUND");
+
+      // f. Project restore
+      const postRestore = await app.request(`/api/projects/${project.id}/restore`, {
+        method: "POST",
+        headers: { Cookie: member.cookie },
+      });
+      expect(postRestore.status).toBe(404);
+      expect((await postRestore.json()).error.code).toBe("NOT_FOUND");
+    });
+
+    it("enforces independent roles and tenant isolation across multiple workspaces for the same user", async () => {
+      const ownerA = await createAndLoginUser("Owner A", "multi-owner-a@example.com");
+      const ownerB = await createAndLoginUser("Owner B", "multi-owner-b@example.com");
+      const multiUser = await createAndLoginUser("Multi User", "multi-user@example.com");
+
+      // Workspace A (multiUser will be Admin)
+      const wsResA = await app.request("/api/workspaces", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: ownerA.cookie },
+        body: JSON.stringify({ name: "Workspace Alpha" }),
+      });
+      const { workspace: wsA } = await wsResA.json();
+
+      // Workspace B (multiUser will be Member)
+      const wsResB = await app.request("/api/workspaces", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: ownerB.cookie },
+        body: JSON.stringify({ name: "Workspace Beta" }),
+      });
+      const { workspace: wsB } = await wsResB.json();
+
+      // Add multiUser to WS A as Admin, and WS B as Member
+      await testDb.insert(workspaceMembers).values([
+        { workspaceId: wsA.id, userId: multiUser.user.id, role: "admin" },
+        { workspaceId: wsB.id, userId: multiUser.user.id, role: "member" },
+      ]);
+
+      // Create Project Alpha in WS A and Project Beta in WS B
+      const projResA = await app.request(`/api/workspaces/${wsA.id}/projects`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: ownerA.cookie },
+        body: JSON.stringify({ name: "Project Alpha" }),
+      });
+      const { project: projA } = await projResA.json();
+
+      const projResB = await app.request(`/api/workspaces/${wsB.id}/projects`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: ownerB.cookie },
+        body: JSON.stringify({ name: "Project Beta" }),
+      });
+      const { project: projB } = await projResB.json();
+
+      // 1. Listing WS A projects returns only Project Alpha
+      const listResA = await app.request(`/api/workspaces/${wsA.id}/projects`, {
+        headers: { Cookie: multiUser.cookie },
+      });
+      expect(listResA.status).toBe(200);
+      const listDataA = await listResA.json();
+      expect(listDataA.projects.map((p: any) => p.id)).toEqual([projA.id]);
+
+      // 2. Listing WS B projects returns only Project Beta
+      const listResB = await app.request(`/api/workspaces/${wsB.id}/projects`, {
+        headers: { Cookie: multiUser.cookie },
+      });
+      expect(listResB.status).toBe(200);
+      const listDataB = await listResB.json();
+      expect(listDataB.projects.map((p: any) => p.id)).toEqual([projB.id]);
+
+      // 3. User can rename Project Alpha (Admin in WS A)
+      const renameA = await app.request(`/api/projects/${projA.id}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json", Cookie: multiUser.cookie },
+        body: JSON.stringify({ name: "Project Alpha Renamed" }),
+      });
+      expect(renameA.status).toBe(200);
+
+      // 4. User cannot rename Project Beta (Member in WS B) -> 403 FORBIDDEN
+      const renameB = await app.request(`/api/projects/${projB.id}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json", Cookie: multiUser.cookie },
+        body: JSON.stringify({ name: "Project Beta Hack" }),
+      });
+      expect(renameB.status).toBe(403);
+      expect((await renameB.json()).error.code).toBe("FORBIDDEN");
+
+      // 5. User cannot archive or restore Project Beta (Member in WS B) -> 403 FORBIDDEN
+      const archiveB = await app.request(`/api/projects/${projB.id}/archive`, {
+        method: "POST",
+        headers: { Cookie: multiUser.cookie },
+      });
+      expect(archiveB.status).toBe(403);
+      expect((await archiveB.json()).error.code).toBe("FORBIDDEN");
+
+      const restoreB = await app.request(`/api/projects/${projB.id}/restore`, {
+        method: "POST",
+        headers: { Cookie: multiUser.cookie },
+      });
+      expect(restoreB.status).toBe(403);
+      expect((await restoreB.json()).error.code).toBe("FORBIDDEN");
+
+      // 6. User can still view Project Beta details and board as Member in WS B
+      const getB = await app.request(`/api/projects/${projB.id}`, {
+        headers: { Cookie: multiUser.cookie },
+      });
+      expect(getB.status).toBe(200);
+
+      const boardB = await app.request(`/api/projects/${projB.id}/board`, {
+        headers: { Cookie: multiUser.cookie },
+      });
+      expect(boardB.status).toBe(200);
+    });
+
+    it("immediately rejects project lifecycle mutations with 403 FORBIDDEN after an Admin is demoted to Member", async () => {
+      const owner = await createAndLoginUser("Owner", "demote-owner@example.com");
+      const user = await createAndLoginUser("Admin To Demote", "demote-user@example.com");
+
+      // 1. Owner creates workspace and project
+      const wsRes = await app.request("/api/workspaces", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        body: JSON.stringify({ name: "Demotion WS" }),
+      });
+      const { workspace } = await wsRes.json();
+
+      const projRes = await app.request(`/api/workspaces/${workspace.id}/projects`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        body: JSON.stringify({ name: "Demotion Project" }),
+      });
+      const { project } = await projRes.json();
+
+      // 2. Add user as Admin
+      await testDb.insert(workspaceMembers).values({
+        workspaceId: workspace.id,
+        userId: user.user.id,
+        role: "admin",
+      });
+
+      // 3. User can rename project while Admin
+      const preRename = await app.request(`/api/projects/${project.id}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json", Cookie: user.cookie },
+        body: JSON.stringify({ name: "Admin Renamed Successfully" }),
+      });
+      expect(preRename.status).toBe(200);
+
+      // 4. Owner demotes user to Member via PATCH /api/workspaces/:workspaceId/members/:memberId
+      const demoteRes = await app.request(
+        `/api/workspaces/${workspace.id}/members/${user.user.id}`,
+        {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+          body: JSON.stringify({ role: "member" }),
+        }
+      );
+      expect(demoteRes.status).toBe(200);
+
+      // 5. Without logging out or obtaining a new session, attempt lifecycle operations -> 403 FORBIDDEN
+      // a. Rename
+      const postRename = await app.request(`/api/projects/${project.id}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json", Cookie: user.cookie },
+        body: JSON.stringify({ name: "Member Attempted Rename" }),
+      });
+      expect(postRename.status).toBe(403);
+      expect((await postRename.json()).error.code).toBe("FORBIDDEN");
+
+      // b. Archive
+      const postArchive = await app.request(`/api/projects/${project.id}/archive`, {
+        method: "POST",
+        headers: { Cookie: user.cookie },
+      });
+      expect(postArchive.status).toBe(403);
+      expect((await postArchive.json()).error.code).toBe("FORBIDDEN");
+
+      // c. Restore
+      const postRestore = await app.request(`/api/projects/${project.id}/restore`, {
+        method: "POST",
+        headers: { Cookie: user.cookie },
+      });
+      expect(postRestore.status).toBe(403);
+      expect((await postRestore.json()).error.code).toBe("FORBIDDEN");
+
+      // 6. Verify user can still view project and board as Member
+      const postGet = await app.request(`/api/projects/${project.id}`, {
+        headers: { Cookie: user.cookie },
+      });
+      expect(postGet.status).toBe(200);
+
+      const postBoard = await app.request(`/api/projects/${project.id}/board`, {
+        headers: { Cookie: user.cookie },
+      });
+      expect(postBoard.status).toBe(200);
+    });
+
+    it("handles concurrent project creation in the same workspace cleanly without column collision or corruption", async () => {
+      const owner = await createAndLoginUser("Owner", "concur-create-owner@example.com");
+
+      const wsRes = await app.request("/api/workspaces", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        body: JSON.stringify({ name: "Concurrent Creation WS" }),
+      });
+      const { workspace } = await wsRes.json();
+
+      // Concurrently issue 4 project creation requests
+      const projectNames = [
+        "Concurrent Project 1",
+        "Concurrent Project 2",
+        "Concurrent Project 3",
+        "Concurrent Project 4",
+      ];
+
+      const creationRequests = projectNames.map((name) =>
+        app.request(`/api/workspaces/${workspace.id}/projects`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+          body: JSON.stringify({ name }),
+        })
+      );
+
+      const responses = await Promise.all(creationRequests);
+
+      // Verify all 4 succeed with 201 Created
+      const createdProjects: any[] = [];
+      for (const res of responses) {
+        expect(res.status).toBe(201);
+        const data = await res.json();
+        createdProjects.push(data.project);
+
+        // Verify each project response returned 4 default columns with positions 0..3
+        expect(data.columns).toHaveLength(4);
+        expect(data.columns.map((c: any) => c.name)).toEqual([
+          "Backlog",
+          "Todo",
+          "In Progress",
+          "Done",
+        ]);
+        expect(data.columns.map((c: any) => c.position)).toEqual([
+          0, 1, 2, 3,
+        ]);
+      }
+
+      // Verify all 4 projects exist in DB and each has exactly 4 columns
+      for (const proj of createdProjects) {
+        const dbCols = await testDb
+          .select()
+          .from(projectColumns)
+          .where(eq(projectColumns.projectId, proj.id));
+        expect(dbCols).toHaveLength(4);
+        expect(dbCols.every((c) => c.projectId === proj.id)).toBe(true);
+
+        const positions = dbCols.map((c) => c.position).sort();
+        expect(positions).toEqual([0, 1, 2, 3]);
+
+        const colNames = dbCols.map((c) => c.name).sort();
+        expect(colNames).toEqual(["Backlog", "Done", "In Progress", "Todo"]);
+      }
+
+      // Verify workspace listing returns all 4 projects
+      const listRes = await app.request(`/api/workspaces/${workspace.id}/projects`, {
+        headers: { Cookie: owner.cookie },
+      });
+      expect(listRes.status).toBe(200);
+      const listData = await listRes.json();
+      expect(listData.projects).toHaveLength(4);
+    });
+  });
 });
 
