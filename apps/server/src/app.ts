@@ -4,6 +4,7 @@ import { createReadyRoute } from "./routes/ready.js";
 import { createWorkspaceRoutes } from "./routes/workspaces.js";
 import { createProjectRoutes } from "./routes/projects.js";
 import { createTaskRoutes } from "./routes/tasks.js";
+import { createCommentRoutes } from "./routes/comments.js";
 import { createAuth, type Auth } from "./auth/index.js";
 import { db as defaultDb, type Database } from "./db/index.js";
 import type { EnvConfig } from "./config/env.js";
@@ -96,6 +97,13 @@ export function createApp(options: AppOptions = {}): Hono {
   app.route(
     "/api/tasks",
     createTaskRoutes({
+      db: targetDb,
+      auth: authInstance,
+    })
+  );
+  app.route(
+    "/api/comments",
+    createCommentRoutes({
       db: targetDb,
       auth: authInstance,
     })

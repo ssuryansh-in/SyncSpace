@@ -4,8 +4,17 @@ import type { Database } from "../db/index.js";
 import type { Auth } from "../auth/index.js";
 import { createRequireAuth } from "../middleware/auth.js";
 import { TaskService } from "../services/task.js";
+import { CommentService } from "../services/comment.js";
 
 const uuidParamSchema = z.string().uuid("Invalid ID format");
+
+const createCommentSchema = z.object({
+  body: z
+    .string({ required_error: "Comment body is required" })
+    .trim()
+    .min(1, "Comment body cannot be empty")
+    .max(10000, "Comment body cannot exceed 10000 characters"),
+});
 
 const updateTaskSchema = z.object({
   title: z
@@ -213,6 +222,89 @@ export function createTaskRoutes(options: TaskRouteOptions): Hono {
     });
 
     return c.json({ task });
+  });
+
+  // 6. POST /api/tasks/:taskId/comments - Create comment on task
+  router.post("/:taskId/comments", async (c) => {
+    const user = c.get("user");
+    const taskId = c.req.param("taskId");
+
+    if (!taskId || !uuidParamSchema.safeParse(taskId).success) {
+      return c.json(
+        {
+          error: {
+            code: "VALIDATION_ERROR",
+            message: "Invalid task ID",
+          },
+        },
+        400
+      );
+    }
+
+    const rawKey = c.req.header("Idempotency-Key");
+    const idempotencyKey = rawKey?.trim();
+    if (!idempotencyKey || idempotencyKey.length === 0 || idempotencyKey.length > 128) {
+      return c.json(
+        {
+          error: {
+            code: "VALIDATION_ERROR",
+            message: "Valid Idempotency-Key header is required (1-128 characters)",
+          },
+        },
+        400
+      );
+    }
+
+    const body = await c.req.json().catch(() => ({}));
+    const parsed = createCommentSchema.safeParse(body);
+
+    if (!parsed.success) {
+      return c.json(
+        {
+          error: {
+            code: "VALIDATION_ERROR",
+            message: "Invalid comment payload",
+            details: parsed.error.flatten(),
+          },
+        },
+        400
+      );
+    }
+
+    const result = await CommentService.createComment(db, {
+      taskId,
+      callerId: user.id,
+      body: parsed.data.body,
+      idempotencyKey,
+      requestPath: c.req.path,
+    });
+
+    return c.json({ comment: result.comment }, 201);
+  });
+
+  // 7. GET /api/tasks/:taskId/comments - List comments for task
+  router.get("/:taskId/comments", async (c) => {
+    const user = c.get("user");
+    const taskId = c.req.param("taskId");
+
+    if (!taskId || !uuidParamSchema.safeParse(taskId).success) {
+      return c.json(
+        {
+          error: {
+            code: "VALIDATION_ERROR",
+            message: "Invalid task ID",
+          },
+        },
+        400
+      );
+    }
+
+    const commentsList = await CommentService.listComments(db, {
+      taskId,
+      callerId: user.id,
+    });
+
+    return c.json({ comments: commentsList });
   });
 
   return router;
