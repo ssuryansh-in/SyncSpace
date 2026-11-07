@@ -1,8 +1,9 @@
-import { and, asc, count, eq, isNull } from "drizzle-orm";
+import { and, asc, count, desc, eq, isNull } from "drizzle-orm";
 import type { Database } from "../db/index.js";
 import { projectColumns, projects, tasks, workspaceMembers, type Task } from "../db/schema/index.js";
 import { AppError } from "../errors/index.js";
 import { computeRequestHash, IdempotencyService } from "./idempotency.js";
+import { generateRankKey } from "../utils/fractional-indexing.js";
 
 export interface CreateTaskParams {
   projectId: string;
@@ -225,14 +226,21 @@ export class TaskService {
           }
         }
 
-        // 8. Generate a deterministic initial rank key for ordering
-        const [colTasksCount] = await tx
-          .select({ value: count() })
+        // 8. Generate fractional rank key: append after the last active task in target column
+        const [lastActiveTask] = await tx
+          .select({ rankKey: tasks.rankKey })
           .from(tasks)
-          .where(and(eq(tasks.projectId, projectId), eq(tasks.columnId, columnId)));
+          .where(
+            and(
+              eq(tasks.projectId, projectId),
+              eq(tasks.columnId, columnId),
+              isNull(tasks.archivedAt)
+            )
+          )
+          .orderBy(desc(tasks.rankKey), desc(tasks.id))
+          .limit(1);
 
-        const taskIndex = colTasksCount?.value ?? 0;
-        const rankKey = `a${taskIndex.toString().padStart(5, "0")}`;
+        const rankKey = generateRankKey(lastActiveTask ? lastActiveTask.rankKey : null, null);
 
         // 9. Insert task row
         const [task] = await tx
@@ -360,7 +368,7 @@ export class TaskService {
       .select()
       .from(tasks)
       .where(and(...conditions))
-      .orderBy(asc(tasks.createdAt));
+      .orderBy(asc(tasks.rankKey), asc(tasks.id));
 
     return rows;
   }

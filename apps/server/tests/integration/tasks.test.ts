@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it } from "vitest";
-import { and, eq } from "drizzle-orm";
+import { and, asc, eq, isNull } from "drizzle-orm";
 import { createApp } from "../../src/app.js";
 import { createAuth } from "../../src/auth/index.js";
 import { createEmailService, clearSentEmailsForTest } from "../../src/services/email.js";
@@ -139,7 +139,7 @@ describe("Tasks Management, Editing, Movement & Lifecycle (Integration - Milesto
       expect(data.task.assigneeId).toBeNull();
       expect(data.task.dueDate).toBeNull();
       expect(data.task.version).toBe(1);
-      expect(data.task.rankKey).toBe("a00000");
+      expect(data.task.rankKey).toBe("a0");
       expect(data.task.archivedAt).toBeNull();
 
       // Verify in DB
@@ -358,6 +358,149 @@ describe("Tasks Management, Editing, Movement & Lifecycle (Integration - Milesto
         body: JSON.stringify({ title: "Member Task", columnId: columns[1].id }),
       });
       expect(memberRes.status).toBe(201);
+    });
+
+    it("generates sequential strictly increasing fractional rank keys ('a0', 'a1', 'a2') when appending to the same column", async () => {
+      const { owner, project, columns } = await setupWorkspaceAndProject();
+      const columnId = columns[0].id;
+
+      // Create 3 tasks sequentially
+      const res1 = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie, "Idempotency-Key": `rank-seq-1-${crypto.randomUUID()}` },
+        body: JSON.stringify({ title: "Task One", columnId }),
+      });
+      expect(res1.status).toBe(201);
+      const data1 = await res1.json();
+      expect(data1.task.rankKey).toBe("a0");
+
+      const res2 = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie, "Idempotency-Key": `rank-seq-2-${crypto.randomUUID()}` },
+        body: JSON.stringify({ title: "Task Two", columnId }),
+      });
+      expect(res2.status).toBe(201);
+      const data2 = await res2.json();
+      expect(data2.task.rankKey).toBe("a1");
+
+      const res3 = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie, "Idempotency-Key": `rank-seq-3-${crypto.randomUUID()}` },
+        body: JSON.stringify({ title: "Task Three", columnId }),
+      });
+      expect(res3.status).toBe(201);
+      const data3 = await res3.json();
+      expect(data3.task.rankKey).toBe("a2");
+
+      // Verify lexicographical order
+      expect(data1.task.rankKey < data2.task.rankKey).toBe(true);
+      expect(data2.task.rankKey < data3.task.rankKey).toBe(true);
+
+      // Verify persisted rank keys in DB
+      const dbTasks = await testDb
+        .select({ id: tasks.id, rankKey: tasks.rankKey })
+        .from(tasks)
+        .where(eq(tasks.projectId, project.id))
+        .orderBy(asc(tasks.rankKey));
+
+      expect(dbTasks.map((t) => t.rankKey)).toEqual(["a0", "a1", "a2"]);
+    });
+
+    it("appends after the last active task when archived tasks exist in the column", async () => {
+      const { owner, project, columns } = await setupWorkspaceAndProject();
+      const columnId = columns[0].id;
+
+      // Create Task 1 ('a0')
+      const res1 = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie, "Idempotency-Key": `rank-arch-1-${crypto.randomUUID()}` },
+        body: JSON.stringify({ title: "Task 1", columnId }),
+      });
+      expect(res1.status).toBe(201);
+      const { task: task1 } = await res1.json();
+      expect(task1.rankKey).toBe("a0");
+
+      // Create Task 2 ('a1')
+      const res2 = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie, "Idempotency-Key": `rank-arch-2-${crypto.randomUUID()}` },
+        body: JSON.stringify({ title: "Task 2", columnId }),
+      });
+      expect(res2.status).toBe(201);
+      const { task: task2 } = await res2.json();
+      expect(task2.rankKey).toBe("a1");
+
+      // Archive Task 2
+      const archRes = await app.request(`/api/tasks/${task2.id}/archive`, {
+        method: "POST",
+        headers: { Cookie: owner.cookie },
+      });
+      expect(archRes.status).toBe(200);
+
+      // Create Task 3 in same column; last active task is Task 1 ('a0'), so Task 3 should get 'a1'
+      const res3 = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie, "Idempotency-Key": `rank-arch-3-${crypto.randomUUID()}` },
+        body: JSON.stringify({ title: "Task 3", columnId }),
+      });
+      expect(res3.status).toBe(201);
+      const { task: task3 } = await res3.json();
+      expect(task3.rankKey).toBe("a1");
+
+      // Verify active tasks in column
+      const activeTasks = await testDb
+        .select({ id: tasks.id, rankKey: tasks.rankKey, archivedAt: tasks.archivedAt })
+        .from(tasks)
+        .where(and(eq(tasks.projectId, project.id), eq(tasks.columnId, columnId), isNull(tasks.archivedAt)))
+        .orderBy(asc(tasks.rankKey), asc(tasks.id));
+
+      expect(activeTasks).toHaveLength(2);
+      expect(activeTasks[0].id).toBe(task1.id);
+      expect(activeTasks[0].rankKey).toBe("a0");
+      expect(activeTasks[1].id).toBe(task3.id);
+      expect(activeTasks[1].rankKey).toBe("a1");
+    });
+
+    it("generates independent rank sequences starting at 'a0' across different columns in the same project", async () => {
+      const { owner, project, columns } = await setupWorkspaceAndProject();
+      const col0Id = columns[0].id;
+      const col1Id = columns[1].id;
+
+      // Col 0 - Task 1 -> 'a0'
+      const resCol0Task1 = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie, "Idempotency-Key": `indep-c0-1-${crypto.randomUUID()}` },
+        body: JSON.stringify({ title: "Col 0 Task 1", columnId: col0Id }),
+      });
+      expect(resCol0Task1.status).toBe(201);
+      expect((await resCol0Task1.json()).task.rankKey).toBe("a0");
+
+      // Col 1 - Task 1 -> 'a0' (independent column start)
+      const resCol1Task1 = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie, "Idempotency-Key": `indep-c1-1-${crypto.randomUUID()}` },
+        body: JSON.stringify({ title: "Col 1 Task 1", columnId: col1Id }),
+      });
+      expect(resCol1Task1.status).toBe(201);
+      expect((await resCol1Task1.json()).task.rankKey).toBe("a0");
+
+      // Col 0 - Task 2 -> 'a1'
+      const resCol0Task2 = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie, "Idempotency-Key": `indep-c0-2-${crypto.randomUUID()}` },
+        body: JSON.stringify({ title: "Col 0 Task 2", columnId: col0Id }),
+      });
+      expect(resCol0Task2.status).toBe(201);
+      expect((await resCol0Task2.json()).task.rankKey).toBe("a1");
+
+      // Col 1 - Task 2 -> 'a1'
+      const resCol1Task2 = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie, "Idempotency-Key": `indep-c1-2-${crypto.randomUUID()}` },
+        body: JSON.stringify({ title: "Col 1 Task 2", columnId: col1Id }),
+      });
+      expect(resCol1Task2.status).toBe(201);
+      expect((await resCol1Task2.json()).task.rankKey).toBe("a1");
     });
   });
 
@@ -651,6 +794,121 @@ describe("Tasks Management, Editing, Movement & Lifecycle (Integration - Milesto
       const data = await res.json();
       expect(data.tasks).toHaveLength(1);
       expect(data.tasks[0].title).toBe("Pre-Archive Task");
+    });
+
+    it("returns tasks ordered deterministically by rankKey ASC, id ASC even when creation order differs", async () => {
+      const { owner, project, columns } = await setupWorkspaceAndProject();
+      const colId = columns[0].id;
+
+      // Insert tasks with specific rank keys directly to verify rankKey-based ordering over createdAt
+      const now = new Date();
+      // Insert Task Middle ('a1') created first
+      const [middleTask] = await testDb
+        .insert(tasks)
+        .values({
+          projectId: project.id,
+          columnId: colId,
+          title: "Middle Task (Created First)",
+          rankKey: "a1",
+          createdBy: owner.user.id,
+          createdAt: new Date(now.getTime() - 2000),
+          updatedAt: new Date(now.getTime() - 2000),
+        })
+        .returning();
+
+      // Insert Task First ('a0') created second
+      const [firstTask] = await testDb
+        .insert(tasks)
+        .values({
+          projectId: project.id,
+          columnId: colId,
+          title: "First Task (Created Second)",
+          rankKey: "a0",
+          createdBy: owner.user.id,
+          createdAt: new Date(now.getTime() - 1000),
+          updatedAt: new Date(now.getTime() - 1000),
+        })
+        .returning();
+
+      // Insert Task Between ('a0V') created last (lexicographically: 'a0' < 'a0V' < 'a1')
+      const [betweenTask] = await testDb
+        .insert(tasks)
+        .values({
+          projectId: project.id,
+          columnId: colId,
+          title: "Between Task (Created Last)",
+          rankKey: "a0V",
+          createdBy: owner.user.id,
+          createdAt: now,
+          updatedAt: now,
+        })
+        .returning();
+
+      const res = await app.request(`/api/projects/${project.id}/tasks`, {
+        headers: { Cookie: owner.cookie },
+      });
+      expect(res.status).toBe(200);
+      const data = await res.json();
+      expect(data.tasks).toHaveLength(3);
+
+      // Verify ordering is strictly by rankKey ASC ('a0' < 'a0V' < 'a1'), not by createdAt
+      expect(data.tasks[0].id).toBe(firstTask.id);
+      expect(data.tasks[0].rankKey).toBe("a0");
+
+      expect(data.tasks[1].id).toBe(betweenTask.id);
+      expect(data.tasks[1].rankKey).toBe("a0V");
+
+      expect(data.tasks[2].id).toBe(middleTask.id);
+      expect(data.tasks[2].rankKey).toBe("a1");
+    });
+
+    it("preserves deterministic rankKey ASC, id ASC ordering when filtering by columnId", async () => {
+      const { owner, project, columns } = await setupWorkspaceAndProject();
+      const targetCol = columns[0];
+      const otherCol = columns[1];
+
+      // Add tasks to target column in non-lexical creation order
+      const [targetB] = await testDb
+        .insert(tasks)
+        .values({
+          projectId: project.id,
+          columnId: targetCol.id,
+          title: "Target B",
+          rankKey: "a1",
+          createdBy: owner.user.id,
+        })
+        .returning();
+
+      const [targetA] = await testDb
+        .insert(tasks)
+        .values({
+          projectId: project.id,
+          columnId: targetCol.id,
+          title: "Target A",
+          rankKey: "a0",
+          createdBy: owner.user.id,
+        })
+        .returning();
+
+      // Add task to other column
+      await testDb.insert(tasks).values({
+        projectId: project.id,
+        columnId: otherCol.id,
+        title: "Other Col Task",
+        rankKey: "a0",
+        createdBy: owner.user.id,
+      });
+
+      const res = await app.request(`/api/projects/${project.id}/tasks?columnId=${targetCol.id}`, {
+        headers: { Cookie: owner.cookie },
+      });
+      expect(res.status).toBe(200);
+      const data = await res.json();
+      expect(data.tasks).toHaveLength(2);
+      expect(data.tasks[0].id).toBe(targetA.id);
+      expect(data.tasks[0].rankKey).toBe("a0");
+      expect(data.tasks[1].id).toBe(targetB.id);
+      expect(data.tasks[1].rankKey).toBe("a1");
     });
   });
 
@@ -2443,6 +2701,114 @@ describe("Tasks Management, Editing, Movement & Lifecycle (Integration - Milesto
         IdempotencyService.save = origSave;
         IdempotencyService.check = origCheck;
       }
+    });
+
+    it("handles concurrent task creation in the same column producing distinct sequential rank keys and deterministic order", async () => {
+      const { owner, project, columns } = await setupWorkspaceAndProject();
+      const colId = columns[0].id;
+
+      // Two concurrent creations in the same column with different idempotency keys
+      const [res1, res2] = await Promise.all([
+        app.request(`/api/projects/${project.id}/tasks`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Cookie: owner.cookie,
+            "Idempotency-Key": `conc-diff-1-${crypto.randomUUID()}`,
+          },
+          body: JSON.stringify({ title: "Concurrent Task Alpha", columnId: colId }),
+        }),
+        app.request(`/api/projects/${project.id}/tasks`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Cookie: owner.cookie,
+            "Idempotency-Key": `conc-diff-2-${crypto.randomUUID()}`,
+          },
+          body: JSON.stringify({ title: "Concurrent Task Beta", columnId: colId }),
+        }),
+      ]);
+
+      expect(res1.status).toBe(201);
+      expect(res2.status).toBe(201);
+
+      const data1 = await res1.json();
+      const data2 = await res2.json();
+
+      const keys = [data1.task.rankKey, data2.task.rankKey].sort();
+      expect(keys).toEqual(["a0", "a1"]);
+
+      // Verify list endpoint returns them in exact rankKey order
+      const listRes = await app.request(`/api/projects/${project.id}/tasks?columnId=${colId}`, {
+        headers: { Cookie: owner.cookie },
+      });
+      expect(listRes.status).toBe(200);
+      const listData = await listRes.json();
+      expect(listData.tasks).toHaveLength(2);
+      expect(listData.tasks[0].rankKey).toBe("a0");
+      expect(listData.tasks[1].rankKey).toBe("a1");
+    });
+
+    it("replaying an idempotent task creation returns the original rank key and does not alter column ordering", async () => {
+      const { owner, project, columns } = await setupWorkspaceAndProject();
+      const colId = columns[0].id;
+      const idempotencyKey = `idemp-rank-replay-${crypto.randomUUID()}`;
+      const payload = { title: "Idempotent Ordered Task", columnId: colId };
+
+      // Initial creation
+      const res1 = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Cookie: owner.cookie,
+          "Idempotency-Key": idempotencyKey,
+        },
+        body: JSON.stringify(payload),
+      });
+      expect(res1.status).toBe(201);
+      const data1 = await res1.json();
+      expect(data1.task.rankKey).toBe("a0");
+
+      // Create a second task
+      const res2 = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Cookie: owner.cookie,
+          "Idempotency-Key": `second-task-${crypto.randomUUID()}`,
+        },
+        body: JSON.stringify({ title: "Second Task", columnId: colId }),
+      });
+      expect(res2.status).toBe(201);
+      const data2 = await res2.json();
+      expect(data2.task.rankKey).toBe("a1");
+
+      // Replay first creation
+      const resReplay = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Cookie: owner.cookie,
+          "Idempotency-Key": idempotencyKey,
+        },
+        body: JSON.stringify(payload),
+      });
+      expect(resReplay.status).toBe(201);
+      const dataReplay = await resReplay.json();
+      expect(dataReplay.task.id).toBe(data1.task.id);
+      expect(dataReplay.task.rankKey).toBe("a0");
+
+      // Verify listing still has exactly 2 tasks in correct rank order
+      const listRes = await app.request(`/api/projects/${project.id}/tasks?columnId=${colId}`, {
+        headers: { Cookie: owner.cookie },
+      });
+      expect(listRes.status).toBe(200);
+      const listData = await listRes.json();
+      expect(listData.tasks).toHaveLength(2);
+      expect(listData.tasks[0].id).toBe(data1.task.id);
+      expect(listData.tasks[0].rankKey).toBe("a0");
+      expect(listData.tasks[1].id).toBe(data2.task.id);
+      expect(listData.tasks[1].rankKey).toBe("a1");
     });
   });
 });
