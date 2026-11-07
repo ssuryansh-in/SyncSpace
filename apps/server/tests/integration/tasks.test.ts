@@ -1505,6 +1505,42 @@ describe("Tasks Management, Editing, Movement & Lifecycle (Integration - Milesto
         .where(eq(tasks.id, task.id));
       expect(dbTask.version).toBe(2);
     });
+
+    it("handles concurrent update and move operations without deadlocks following project-first lock order", async () => {
+      const { owner, project, columns } = await setupWorkspaceAndProject();
+
+      const createRes = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie, "Idempotency-Key": `task-seed-${crypto.randomUUID()}` },
+        body: JSON.stringify({ title: "Concurrent Move/Update Task", columnId: columns[0].id }),
+      });
+      const { task } = await createRes.json();
+
+      // Launch concurrent updateTask and moveTask against the same task and project
+      const [updateRes, moveRes] = await Promise.all([
+        app.request(`/api/tasks/${task.id}`, {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+          body: JSON.stringify({ title: "Updated in Race", expectedVersion: 1 }),
+        }),
+        app.request(`/api/tasks/${task.id}/move`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+          body: JSON.stringify({ columnId: columns[1].id, expectedVersion: 1 }),
+        }),
+      ]);
+
+      // Both operations must finish without deadlock (neither should fail with a 500 error)
+      const statuses = [updateRes.status, moveRes.status].sort();
+      // One wins on expectedVersion 1 (200), the second gets VERSION_CONFLICT (409)
+      expect(statuses).toEqual([200, 409]);
+
+      const [dbTask] = await testDb
+        .select()
+        .from(tasks)
+        .where(eq(tasks.id, task.id));
+      expect(dbTask.version).toBe(2);
+    });
   });
 
   describe("Task Movement (POST /api/tasks/:taskId/move)", () => {

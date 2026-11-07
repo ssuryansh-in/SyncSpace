@@ -62,6 +62,143 @@ export interface RestoreTaskParams {
   callerId: string;
 }
 
+// ============================================================================
+// Canonical Task Snapshot & Diff Helpers (Milestone 7.2A)
+// Reference: docs/SPECIFICATION.md Section 8.3, 8.6; docs/DATA.md Section 2.4
+// ============================================================================
+
+export interface CanonicalTaskSnapshot {
+  id: string;
+  projectId: string;
+  columnId: string;
+  title: string;
+  description: string;
+  createdBy: string;
+  assigneeId: string | null;
+  rankKey: string;
+  version: number;
+  dueDate: string | null;
+  createdAt: string;
+  updatedAt: string;
+  archivedAt: string | null;
+}
+
+export type TaskChangeValue =
+  | { changed: true }
+  | { from: unknown; to: unknown }
+  | { to: unknown };
+
+export type TaskChanges = Record<string, TaskChangeValue>;
+
+/**
+ * Builds the canonical task snapshot carried by every task.* project event.
+ * Conforms strictly to docs/SPECIFICATION.md Section 8.6.
+ * Pure, deterministic, side-effect free.
+ */
+export function buildTaskSnapshot(task: Task): CanonicalTaskSnapshot {
+  return {
+    id: task.id,
+    projectId: task.projectId,
+    columnId: task.columnId,
+    title: task.title,
+    description: task.description,
+    createdBy: task.createdBy,
+    assigneeId: task.assigneeId ?? null,
+    rankKey: task.rankKey,
+    version: task.version,
+    dueDate: task.dueDate ?? null,
+    createdAt: task.createdAt instanceof Date ? task.createdAt.toISOString() : new Date(task.createdAt).toISOString(),
+    updatedAt: task.updatedAt instanceof Date ? task.updatedAt.toISOString() : new Date(task.updatedAt).toISOString(),
+    archivedAt: task.archivedAt
+      ? task.archivedAt instanceof Date
+        ? task.archivedAt.toISOString()
+        : new Date(task.archivedAt).toISOString()
+      : null,
+  };
+}
+
+/**
+ * Builds the diff (changes) object comparing before-state and after-state of a task.
+ * Conforms strictly to docs/SPECIFICATION.md Section 8.3.
+ * Privacy Invariant: Description text NEVER appears in changes; strictly uses { description: { changed: true } }.
+ * Pure, deterministic, side-effect free.
+ */
+export function buildTaskChanges(before: Task, after: Task): TaskChanges {
+  const changes: TaskChanges = {};
+
+  if (before.title !== after.title) {
+    changes["title"] = { from: before.title, to: after.title };
+  }
+
+  if (before.description !== after.description) {
+    changes["description"] = { changed: true };
+  }
+
+  if (before.columnId !== after.columnId) {
+    changes["columnId"] = { from: before.columnId, to: after.columnId };
+  }
+
+  const beforeAssignee = before.assigneeId ?? null;
+  const afterAssignee = after.assigneeId ?? null;
+  if (beforeAssignee !== afterAssignee) {
+    changes["assigneeId"] = { from: beforeAssignee, to: afterAssignee };
+  }
+
+  const beforeDueDate = before.dueDate ?? null;
+  const afterDueDate = after.dueDate ?? null;
+  if (beforeDueDate !== afterDueDate) {
+    changes["dueDate"] = { from: beforeDueDate, to: afterDueDate };
+  }
+
+  if (before.rankKey !== after.rankKey) {
+    changes["rankKey"] = { from: before.rankKey, to: after.rankKey };
+  }
+
+  const beforeArchived = before.archivedAt
+    ? before.archivedAt instanceof Date
+      ? before.archivedAt.toISOString()
+      : new Date(before.archivedAt).toISOString()
+    : null;
+  const afterArchived = after.archivedAt
+    ? after.archivedAt instanceof Date
+      ? after.archivedAt.toISOString()
+      : new Date(after.archivedAt).toISOString()
+    : null;
+  if (beforeArchived !== afterArchived) {
+    changes["archivedAt"] = { from: beforeArchived, to: afterArchived };
+  }
+
+  return changes;
+}
+
+/**
+ * Builds the initial changes object for task.created.
+ * In accordance with docs/SPECIFICATION.md Section 8.3, omits 'from' and includes only 'to'.
+ * Privacy Invariant: Description uses { changed: true }, never raw text.
+ * Pure, deterministic, side-effect free.
+ */
+export function buildTaskCreatedChanges(task: Task): TaskChanges {
+  const changes: TaskChanges = {
+    title: { to: task.title },
+    columnId: { to: task.columnId },
+    rankKey: { to: task.rankKey },
+  };
+
+  if (task.description && task.description.length > 0) {
+    changes["description"] = { changed: true };
+  }
+
+  if (task.assigneeId) {
+    changes["assigneeId"] = { to: task.assigneeId };
+  }
+
+  if (task.dueDate) {
+    changes["dueDate"] = { to: task.dueDate };
+  }
+
+  return changes;
+}
+
 /**
  * Domain service managing task creation, retrieval, editing, movement, and lifecycle.
  * Reference: docs/SPECIFICATION.md Section 4.2, 6.4, 7.2, 7.3, 7.4, 9.6, 10.3
@@ -481,11 +618,26 @@ export class TaskService {
     return task;
   }
 
+  static buildSnapshot = buildTaskSnapshot;
+  static buildChanges = buildTaskChanges;
+  static buildCreatedChanges = buildTaskCreatedChanges;
+
   /**
    * Updates task fields. Requires matching expectedVersion.
    * Rejects mutations on archived tasks with 409 TASK_ARCHIVED.
    * Rejects mutations in archived projects with 409 PROJECT_ARCHIVED.
    * Increments version and updates updatedAt if fields changed; no-op if identical values.
+   *
+   * Lock Hierarchy: workspaces -> projects -> columns -> tasks -> comments
+   * Establishes project-first locking:
+   * 1. Unlocked metadata lookup to discover projectId
+   * 2. Project row lock using FOR UPDATE
+   * 3. Authorization and tenant-concealment checks
+   * 4. Task row lock using FOR UPDATE (verifying task.projectId === project.id)
+   * 5. Archived-state and optimistic-version checks
+   * 6. Assignee membership validation
+   * 7. No-op detection
+   * 8. Atomic task update
    */
   static async updateTask(
     db: Database,
@@ -500,27 +652,68 @@ export class TaskService {
     }: UpdateTaskParams
   ): Promise<Task> {
     return await db.transaction(async (tx) => {
-      // 1. Lock task row and verify context
-      const { task, project } = await this.getTaskWithContext(tx, taskId, callerId, true);
+      // 1. Perform an unlocked lookup of the task to discover its projectId
+      const [taskSnapshot] = await tx
+        .select({ id: tasks.id, projectId: tasks.projectId })
+        .from(tasks)
+        .where(eq(tasks.id, taskId));
 
-      // 2. Reject if task is archived
-      if (task.archivedAt !== null) {
-        throw AppError.conflict("TASK_ARCHIVED", "Cannot modify an archived task");
+      if (!taskSnapshot) {
+        throw AppError.notFound("Task not found");
       }
 
-      // 3. Reject if parent project is archived
+      // 2. Lock the project row using FOR UPDATE (establishing project-first lock order)
+      const [project] = await (tx
+        .select()
+        .from(projects)
+        .where(eq(projects.id, taskSnapshot.projectId)) as any).for("update");
+
+      if (!project) {
+        throw AppError.notFound("Task not found");
+      }
+
+      // 3. Authorization & Tenant Isolation check (conceals private projects from non-members)
+      const [callerMembership] = await tx
+        .select()
+        .from(workspaceMembers)
+        .where(
+          and(
+            eq(workspaceMembers.workspaceId, project.workspaceId),
+            eq(workspaceMembers.userId, callerId)
+          )
+        );
+
+      if (!callerMembership) {
+        throw AppError.notFound("Task not found");
+      }
+
       if (project.archivedAt !== null) {
         throw AppError.conflict("PROJECT_ARCHIVED", "Cannot modify a task in an archived project");
       }
 
-      // 4. Validate expectedVersion
+      // 4. Lock task row using FOR UPDATE (after project lock is held)
+      const [task] = await (tx
+        .select()
+        .from(tasks)
+        .where(eq(tasks.id, taskId)) as any).for("update");
+
+      if (!task || task.projectId !== project.id) {
+        throw AppError.notFound("Task not found");
+      }
+
+      // 5. Reject if task is archived
+      if (task.archivedAt !== null) {
+        throw AppError.conflict("TASK_ARCHIVED", "Cannot modify an archived task");
+      }
+
+      // 6. Validate expectedVersion
       if (task.version !== expectedVersion) {
         throw AppError.conflict("VERSION_CONFLICT", "This task changed since you loaded it.", {
           currentVersion: task.version,
         });
       }
 
-      // 5. If assignee is provided and changed, verify assignee is an active workspace member
+      // 7. If assignee is provided and changed, verify assignee is an active workspace member
       if (assigneeId !== undefined && assigneeId !== null && assigneeId !== task.assigneeId) {
         const [assigneeMembership] = await tx
           .select()
@@ -537,7 +730,7 @@ export class TaskService {
         }
       }
 
-      // 6. Check for actual state changes (identifying no-op edits)
+      // 8. Check for actual state changes (identifying no-op edits)
       const nextTitle = title !== undefined ? title.trim() : task.title;
       const nextDesc = description !== undefined ? description.trim() : task.description;
       const nextAssignee = assigneeId !== undefined ? assigneeId : task.assigneeId;
@@ -554,7 +747,7 @@ export class TaskService {
         return task;
       }
 
-      // 7. Atomic update incrementing version exactly once
+      // 9. Atomic update incrementing version exactly once
       const [updatedTask] = await tx
         .update(tasks)
         .set({
