@@ -15,6 +15,13 @@
       "when": 1793256024551,
       "tag": "0001_auth_tables",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1793260000000,
+      "tag": "0002_task_rank_key_collation",
+      "breakpoints": true
     }
   ]
 }
