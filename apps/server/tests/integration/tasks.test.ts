@@ -1530,7 +1530,7 @@ describe("Tasks Management, Editing, Movement & Lifecycle (Integration - Milesto
       const data = await res.json();
       expect(data.task.id).toBe(task.id);
       expect(data.task.columnId).toBe(col1.id);
-      expect(data.task.rankKey).toBe("a00000");
+      expect(data.task.rankKey).toBe("a0");
       expect(data.task.version).toBe(2);
       expect(new Date(data.task.updatedAt).getTime()).toBeGreaterThanOrEqual(
         new Date(task.updatedAt).getTime()
@@ -1579,7 +1579,7 @@ describe("Tasks Management, Editing, Movement & Lifecycle (Integration - Milesto
       expect(res.status).toBe(200);
       const data = await res.json();
       expect(data.task.columnId).toBe(col1.id);
-      expect(data.task.rankKey).toBe("a00002");
+      expect(data.task.rankKey).toBe("a2");
       expect(data.task.version).toBe(2);
     });
 
@@ -1834,6 +1834,1033 @@ describe("Tasks Management, Editing, Movement & Lifecycle (Integration - Milesto
         .from(tasks)
         .where(eq(tasks.id, task.id));
       expect(dbTask.version).toBe(2);
+    });
+
+    // ==========================================
+    // Anchor-Based Movement & Reordering (6.5B Commit 3)
+    // ==========================================
+
+    it("moves a task to the beginning of a column using nextTaskId", async () => {
+      const { owner, project, columns } = await setupWorkspaceAndProject();
+      const col0 = columns[0];
+      const col1 = columns[1];
+
+      // Create two tasks in col1
+      const c1Res = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie, "Idempotency-Key": `seed-c1-${crypto.randomUUID()}` },
+        body: JSON.stringify({ title: "Col1 Task 1", columnId: col1.id }),
+      });
+      const { task: t1 } = await c1Res.json();
+
+      const c2Res = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie, "Idempotency-Key": `seed-c2-${crypto.randomUUID()}` },
+        body: JSON.stringify({ title: "Col1 Task 2", columnId: col1.id }),
+      });
+      const { task: t2 } = await c2Res.json();
+
+      // Create task in col0 to move
+      const mRes = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie, "Idempotency-Key": `seed-m-${crypto.randomUUID()}` },
+        body: JSON.stringify({ title: "Move to Beginning", columnId: col0.id }),
+      });
+      const { task: toMove } = await mRes.json();
+
+      const moveRes = await app.request(`/api/tasks/${toMove.id}/move`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        body: JSON.stringify({
+          columnId: col1.id,
+          expectedVersion: 1,
+          nextTaskId: t1.id,
+        }),
+      });
+
+      expect(moveRes.status).toBe(200);
+      const moveData = await moveRes.json();
+      expect(moveData.task.columnId).toBe(col1.id);
+      expect(moveData.task.version).toBe(2);
+      expect(moveData.task.rankKey < t1.rankKey).toBe(true);
+
+      // Verify col1 list order
+      const listRes = await app.request(`/api/projects/${project.id}/tasks`, {
+        headers: { Cookie: owner.cookie },
+      });
+      const listData = await listRes.json();
+      const col1Tasks = listData.tasks.filter((t: any) => t.columnId === col1.id);
+      expect(col1Tasks.map((t: any) => t.id)).toEqual([toMove.id, t1.id, t2.id]);
+    });
+
+    it("moves a task to the end of a column using prevTaskId", async () => {
+      const { owner, project, columns } = await setupWorkspaceAndProject();
+      const col0 = columns[0];
+      const col1 = columns[1];
+
+      const c1Res = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie, "Idempotency-Key": `seed-c1-${crypto.randomUUID()}` },
+        body: JSON.stringify({ title: "Col1 Task 1", columnId: col1.id }),
+      });
+      const { task: t1 } = await c1Res.json();
+
+      const c2Res = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie, "Idempotency-Key": `seed-c2-${crypto.randomUUID()}` },
+        body: JSON.stringify({ title: "Col1 Task 2", columnId: col1.id }),
+      });
+      const { task: t2 } = await c2Res.json();
+
+      const mRes = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie, "Idempotency-Key": `seed-m-${crypto.randomUUID()}` },
+        body: JSON.stringify({ title: "Move to End", columnId: col0.id }),
+      });
+      const { task: toMove } = await mRes.json();
+
+      const moveRes = await app.request(`/api/tasks/${toMove.id}/move`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        body: JSON.stringify({
+          columnId: col1.id,
+          expectedVersion: 1,
+          prevTaskId: t2.id,
+        }),
+      });
+
+      expect(moveRes.status).toBe(200);
+      const moveData = await moveRes.json();
+      expect(moveData.task.columnId).toBe(col1.id);
+      expect(moveData.task.version).toBe(2);
+      expect(moveData.task.rankKey > t2.rankKey).toBe(true);
+
+      const listRes = await app.request(`/api/projects/${project.id}/tasks`, {
+        headers: { Cookie: owner.cookie },
+      });
+      const listData = await listRes.json();
+      const col1Tasks = listData.tasks.filter((t: any) => t.columnId === col1.id);
+      expect(col1Tasks.map((t: any) => t.id)).toEqual([t1.id, t2.id, toMove.id]);
+    });
+
+    it("inserts a task between two adjacent anchor tasks", async () => {
+      const { owner, project, columns } = await setupWorkspaceAndProject();
+      const col0 = columns[0];
+      const col1 = columns[1];
+
+      const c1Res = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie, "Idempotency-Key": `seed-c1-${crypto.randomUUID()}` },
+        body: JSON.stringify({ title: "Col1 Task 1", columnId: col1.id }),
+      });
+      const { task: t1 } = await c1Res.json();
+
+      const c2Res = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie, "Idempotency-Key": `seed-c2-${crypto.randomUUID()}` },
+        body: JSON.stringify({ title: "Col1 Task 2", columnId: col1.id }),
+      });
+      const { task: t2 } = await c2Res.json();
+
+      const mRes = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie, "Idempotency-Key": `seed-m-${crypto.randomUUID()}` },
+        body: JSON.stringify({ title: "Insert Between", columnId: col0.id }),
+      });
+      const { task: toMove } = await mRes.json();
+
+      const moveRes = await app.request(`/api/tasks/${toMove.id}/move`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        body: JSON.stringify({
+          columnId: col1.id,
+          expectedVersion: 1,
+          prevTaskId: t1.id,
+          nextTaskId: t2.id,
+        }),
+      });
+
+      expect(moveRes.status).toBe(200);
+      const moveData = await moveRes.json();
+      expect(moveData.task.columnId).toBe(col1.id);
+      expect(moveData.task.version).toBe(2);
+      expect(moveData.task.rankKey > t1.rankKey).toBe(true);
+      expect(moveData.task.rankKey < t2.rankKey).toBe(true);
+
+      const listRes = await app.request(`/api/projects/${project.id}/tasks`, {
+        headers: { Cookie: owner.cookie },
+      });
+      const listData = await listRes.json();
+      const col1Tasks = listData.tasks.filter((t: any) => t.columnId === col1.id);
+      expect(col1Tasks.map((t: any) => t.id)).toEqual([t1.id, toMove.id, t2.id]);
+    });
+
+    it("infers nextTaskId when only prevTaskId is provided (not last task)", async () => {
+      const { owner, project, columns } = await setupWorkspaceAndProject();
+      const col0 = columns[0];
+      const col1 = columns[1];
+
+      const c1Res = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie, "Idempotency-Key": `seed-c1-${crypto.randomUUID()}` },
+        body: JSON.stringify({ title: "T1", columnId: col1.id }),
+      });
+      const { task: t1 } = await c1Res.json();
+
+      const c2Res = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie, "Idempotency-Key": `seed-c2-${crypto.randomUUID()}` },
+        body: JSON.stringify({ title: "T2", columnId: col1.id }),
+      });
+      const { task: t2 } = await c2Res.json();
+
+      const c3Res = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie, "Idempotency-Key": `seed-c3-${crypto.randomUUID()}` },
+        body: JSON.stringify({ title: "T3", columnId: col1.id }),
+      });
+      const { task: t3 } = await c3Res.json();
+
+      const mRes = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie, "Idempotency-Key": `seed-m-${crypto.randomUUID()}` },
+        body: JSON.stringify({ title: "Move", columnId: col0.id }),
+      });
+      const { task: toMove } = await mRes.json();
+
+      // Only prevTaskId: t1.id (t2 is immediate next)
+      const moveRes = await app.request(`/api/tasks/${toMove.id}/move`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        body: JSON.stringify({
+          columnId: col1.id,
+          expectedVersion: 1,
+          prevTaskId: t1.id,
+        }),
+      });
+
+      expect(moveRes.status).toBe(200);
+      const moveData = await moveRes.json();
+      expect(moveData.task.rankKey > t1.rankKey).toBe(true);
+      expect(moveData.task.rankKey < t2.rankKey).toBe(true);
+
+      const listRes = await app.request(`/api/projects/${project.id}/tasks`, {
+        headers: { Cookie: owner.cookie },
+      });
+      const listData = await listRes.json();
+      const col1Tasks = listData.tasks.filter((t: any) => t.columnId === col1.id);
+      expect(col1Tasks.map((t: any) => t.id)).toEqual([t1.id, toMove.id, t2.id, t3.id]);
+    });
+
+    it("infers prevTaskId when only nextTaskId is provided (not first task)", async () => {
+      const { owner, project, columns } = await setupWorkspaceAndProject();
+      const col0 = columns[0];
+      const col1 = columns[1];
+
+      const c1Res = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie, "Idempotency-Key": `seed-c1-${crypto.randomUUID()}` },
+        body: JSON.stringify({ title: "T1", columnId: col1.id }),
+      });
+      const { task: t1 } = await c1Res.json();
+
+      const c2Res = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie, "Idempotency-Key": `seed-c2-${crypto.randomUUID()}` },
+        body: JSON.stringify({ title: "T2", columnId: col1.id }),
+      });
+      const { task: t2 } = await c2Res.json();
+
+      const c3Res = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie, "Idempotency-Key": `seed-c3-${crypto.randomUUID()}` },
+        body: JSON.stringify({ title: "T3", columnId: col1.id }),
+      });
+      const { task: t3 } = await c3Res.json();
+
+      const mRes = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie, "Idempotency-Key": `seed-m-${crypto.randomUUID()}` },
+        body: JSON.stringify({ title: "Move", columnId: col0.id }),
+      });
+      const { task: toMove } = await mRes.json();
+
+      // Only nextTaskId: t2.id (t1 is immediate prev)
+      const moveRes = await app.request(`/api/tasks/${toMove.id}/move`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        body: JSON.stringify({
+          columnId: col1.id,
+          expectedVersion: 1,
+          nextTaskId: t2.id,
+        }),
+      });
+
+      expect(moveRes.status).toBe(200);
+      const moveData = await moveRes.json();
+      expect(moveData.task.rankKey > t1.rankKey).toBe(true);
+      expect(moveData.task.rankKey < t2.rankKey).toBe(true);
+
+      const listRes = await app.request(`/api/projects/${project.id}/tasks`, {
+        headers: { Cookie: owner.cookie },
+      });
+      const listData = await listRes.json();
+      const col1Tasks = listData.tasks.filter((t: any) => t.columnId === col1.id);
+      expect(col1Tasks.map((t: any) => t.id)).toEqual([t1.id, toMove.id, t2.id, t3.id]);
+    });
+
+    it("reorders a task within the same column to the end", async () => {
+      const { owner, project, columns } = await setupWorkspaceAndProject();
+      const col0 = columns[0];
+
+      const c1Res = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie, "Idempotency-Key": `seed-c1-${crypto.randomUUID()}` },
+        body: JSON.stringify({ title: "T1", columnId: col0.id }),
+      });
+      const { task: t1 } = await c1Res.json();
+
+      const c2Res = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie, "Idempotency-Key": `seed-c2-${crypto.randomUUID()}` },
+        body: JSON.stringify({ title: "T2", columnId: col0.id }),
+      });
+      const { task: t2 } = await c2Res.json();
+
+      const c3Res = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie, "Idempotency-Key": `seed-c3-${crypto.randomUUID()}` },
+        body: JSON.stringify({ title: "T3", columnId: col0.id }),
+      });
+      const { task: t3 } = await c3Res.json();
+
+      // Move t1 to end after t3
+      const moveRes = await app.request(`/api/tasks/${t1.id}/move`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        body: JSON.stringify({
+          columnId: col0.id,
+          expectedVersion: 1,
+          prevTaskId: t3.id,
+        }),
+      });
+
+      expect(moveRes.status).toBe(200);
+      const moveData = await moveRes.json();
+      expect(moveData.task.version).toBe(2);
+      expect(moveData.task.rankKey > t3.rankKey).toBe(true);
+
+      const listRes = await app.request(`/api/projects/${project.id}/tasks`, {
+        headers: { Cookie: owner.cookie },
+      });
+      const listData = await listRes.json();
+      const col0Tasks = listData.tasks.filter((t: any) => t.columnId === col0.id);
+      expect(col0Tasks.map((t: any) => t.id)).toEqual([t2.id, t3.id, t1.id]);
+    });
+
+    it("reorders a task within the same column to the beginning", async () => {
+      const { owner, project, columns } = await setupWorkspaceAndProject();
+      const col0 = columns[0];
+
+      const c1Res = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie, "Idempotency-Key": `seed-c1-${crypto.randomUUID()}` },
+        body: JSON.stringify({ title: "T1", columnId: col0.id }),
+      });
+      const { task: t1 } = await c1Res.json();
+
+      const c2Res = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie, "Idempotency-Key": `seed-c2-${crypto.randomUUID()}` },
+        body: JSON.stringify({ title: "T2", columnId: col0.id }),
+      });
+      const { task: t2 } = await c2Res.json();
+
+      const c3Res = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie, "Idempotency-Key": `seed-c3-${crypto.randomUUID()}` },
+        body: JSON.stringify({ title: "T3", columnId: col0.id }),
+      });
+      const { task: t3 } = await c3Res.json();
+
+      // Move t3 to beginning before t1
+      const moveRes = await app.request(`/api/tasks/${t3.id}/move`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        body: JSON.stringify({
+          columnId: col0.id,
+          expectedVersion: 1,
+          nextTaskId: t1.id,
+        }),
+      });
+
+      expect(moveRes.status).toBe(200);
+      const moveData = await moveRes.json();
+      expect(moveData.task.version).toBe(2);
+      expect(moveData.task.rankKey < t1.rankKey).toBe(true);
+
+      const listRes = await app.request(`/api/projects/${project.id}/tasks`, {
+        headers: { Cookie: owner.cookie },
+      });
+      const listData = await listRes.json();
+      const col0Tasks = listData.tasks.filter((t: any) => t.columnId === col0.id);
+      expect(col0Tasks.map((t: any) => t.id)).toEqual([t3.id, t1.id, t2.id]);
+    });
+
+    it("reorders a task within the same column between two other tasks", async () => {
+      const { owner, project, columns } = await setupWorkspaceAndProject();
+      const col0 = columns[0];
+
+      const c1Res = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie, "Idempotency-Key": `seed-c1-${crypto.randomUUID()}` },
+        body: JSON.stringify({ title: "T1", columnId: col0.id }),
+      });
+      const { task: t1 } = await c1Res.json();
+
+      const c2Res = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie, "Idempotency-Key": `seed-c2-${crypto.randomUUID()}` },
+        body: JSON.stringify({ title: "T2", columnId: col0.id }),
+      });
+      const { task: t2 } = await c2Res.json();
+
+      const c3Res = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie, "Idempotency-Key": `seed-c3-${crypto.randomUUID()}` },
+        body: JSON.stringify({ title: "T3", columnId: col0.id }),
+      });
+      const { task: t3 } = await c3Res.json();
+
+      // Move t3 between t1 and t2
+      const moveRes = await app.request(`/api/tasks/${t3.id}/move`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        body: JSON.stringify({
+          columnId: col0.id,
+          expectedVersion: 1,
+          prevTaskId: t1.id,
+          nextTaskId: t2.id,
+        }),
+      });
+
+      expect(moveRes.status).toBe(200);
+      const moveData = await moveRes.json();
+      expect(moveData.task.version).toBe(2);
+      expect(moveData.task.rankKey > t1.rankKey).toBe(true);
+      expect(moveData.task.rankKey < t2.rankKey).toBe(true);
+
+      const listRes = await app.request(`/api/projects/${project.id}/tasks`, {
+        headers: { Cookie: owner.cookie },
+      });
+      const listData = await listRes.json();
+      const col0Tasks = listData.tasks.filter((t: any) => t.columnId === col0.id);
+      expect(col0Tasks.map((t: any) => t.id)).toEqual([t1.id, t3.id, t2.id]);
+    });
+
+    // ==========================================
+    // Anchor Validation & Error Cases
+    // ==========================================
+
+    it("rejects non-adjacent anchors with 400 VALIDATION_ERROR", async () => {
+      const { owner, project, columns } = await setupWorkspaceAndProject();
+      const col0 = columns[0];
+      const col1 = columns[1];
+
+      const c1Res = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie, "Idempotency-Key": `seed-c1-${crypto.randomUUID()}` },
+        body: JSON.stringify({ title: "T1", columnId: col1.id }),
+      });
+      const { task: t1 } = await c1Res.json();
+
+      await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie, "Idempotency-Key": `seed-c2-${crypto.randomUUID()}` },
+        body: JSON.stringify({ title: "T2", columnId: col1.id }),
+      });
+
+      const c3Res = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie, "Idempotency-Key": `seed-c3-${crypto.randomUUID()}` },
+        body: JSON.stringify({ title: "T3", columnId: col1.id }),
+      });
+      const { task: t3 } = await c3Res.json();
+
+      const mRes = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie, "Idempotency-Key": `seed-m-${crypto.randomUUID()}` },
+        body: JSON.stringify({ title: "Move", columnId: col0.id }),
+      });
+      const { task: toMove } = await mRes.json();
+
+      // Pass t1 and t3 as anchors (t2 is between them)
+      const res = await app.request(`/api/tasks/${toMove.id}/move`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        body: JSON.stringify({
+          columnId: col1.id,
+          expectedVersion: 1,
+          prevTaskId: t1.id,
+          nextTaskId: t3.id,
+        }),
+      });
+
+      expect(res.status).toBe(400);
+      const body = await res.json();
+      expect(body.error.code).toBe("VALIDATION_ERROR");
+      expect(body.error.message).toContain("Anchor tasks are not adjacent");
+    });
+
+    it("rejects reversed anchors with 400 VALIDATION_ERROR", async () => {
+      const { owner, project, columns } = await setupWorkspaceAndProject();
+      const col0 = columns[0];
+      const col1 = columns[1];
+
+      const c1Res = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie, "Idempotency-Key": `seed-c1-${crypto.randomUUID()}` },
+        body: JSON.stringify({ title: "T1", columnId: col1.id }),
+      });
+      const { task: t1 } = await c1Res.json();
+
+      const c2Res = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie, "Idempotency-Key": `seed-c2-${crypto.randomUUID()}` },
+        body: JSON.stringify({ title: "T2", columnId: col1.id }),
+      });
+      const { task: t2 } = await c2Res.json();
+
+      const mRes = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie, "Idempotency-Key": `seed-m-${crypto.randomUUID()}` },
+        body: JSON.stringify({ title: "Move", columnId: col0.id }),
+      });
+      const { task: toMove } = await mRes.json();
+
+      // Reversed: prevTaskId is t2, nextTaskId is t1
+      const res = await app.request(`/api/tasks/${toMove.id}/move`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        body: JSON.stringify({
+          columnId: col1.id,
+          expectedVersion: 1,
+          prevTaskId: t2.id,
+          nextTaskId: t1.id,
+        }),
+      });
+
+      expect(res.status).toBe(400);
+      const body = await res.json();
+      expect(body.error.code).toBe("VALIDATION_ERROR");
+      expect(body.error.message).toContain("Anchor tasks are not adjacent");
+    });
+
+    it("rejects using moving task as its own prevTaskId with 400 VALIDATION_ERROR", async () => {
+      const { owner, project, columns } = await setupWorkspaceAndProject();
+
+      const mRes = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie, "Idempotency-Key": `seed-m-${crypto.randomUUID()}` },
+        body: JSON.stringify({ title: "Self Prev", columnId: columns[0].id }),
+      });
+      const { task: toMove } = await mRes.json();
+
+      const res = await app.request(`/api/tasks/${toMove.id}/move`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        body: JSON.stringify({
+          columnId: columns[1].id,
+          expectedVersion: 1,
+          prevTaskId: toMove.id,
+        }),
+      });
+
+      expect(res.status).toBe(400);
+      const body = await res.json();
+      expect(body.error.code).toBe("VALIDATION_ERROR");
+      expect(body.error.message).toContain("Moving task cannot be used as its own anchor");
+    });
+
+    it("rejects using moving task as its own nextTaskId with 400 VALIDATION_ERROR", async () => {
+      const { owner, project, columns } = await setupWorkspaceAndProject();
+
+      const mRes = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie, "Idempotency-Key": `seed-m-${crypto.randomUUID()}` },
+        body: JSON.stringify({ title: "Self Next", columnId: columns[0].id }),
+      });
+      const { task: toMove } = await mRes.json();
+
+      const res = await app.request(`/api/tasks/${toMove.id}/move`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        body: JSON.stringify({
+          columnId: columns[1].id,
+          expectedVersion: 1,
+          nextTaskId: toMove.id,
+        }),
+      });
+
+      expect(res.status).toBe(400);
+      const body = await res.json();
+      expect(body.error.code).toBe("VALIDATION_ERROR");
+      expect(body.error.message).toContain("Moving task cannot be used as its own anchor");
+    });
+
+    it("rejects identical prevTaskId and nextTaskId with 400 VALIDATION_ERROR", async () => {
+      const { owner, project, columns } = await setupWorkspaceAndProject();
+      const col1 = columns[1];
+
+      const c1Res = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie, "Idempotency-Key": `seed-c1-${crypto.randomUUID()}` },
+        body: JSON.stringify({ title: "T1", columnId: col1.id }),
+      });
+      const { task: t1 } = await c1Res.json();
+
+      const mRes = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie, "Idempotency-Key": `seed-m-${crypto.randomUUID()}` },
+        body: JSON.stringify({ title: "Move", columnId: columns[0].id }),
+      });
+      const { task: toMove } = await mRes.json();
+
+      const res = await app.request(`/api/tasks/${toMove.id}/move`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        body: JSON.stringify({
+          columnId: col1.id,
+          expectedVersion: 1,
+          prevTaskId: t1.id,
+          nextTaskId: t1.id,
+        }),
+      });
+
+      expect(res.status).toBe(400);
+      const body = await res.json();
+      expect(body.error.code).toBe("VALIDATION_ERROR");
+      expect(body.error.message).toContain("Anchors must be distinct");
+    });
+
+    it("rejects nonexistent anchor UUID with 400 VALIDATION_ERROR", async () => {
+      const { owner, project, columns } = await setupWorkspaceAndProject();
+
+      const mRes = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie, "Idempotency-Key": `seed-m-${crypto.randomUUID()}` },
+        body: JSON.stringify({ title: "Move", columnId: columns[0].id }),
+      });
+      const { task: toMove } = await mRes.json();
+
+      const fakeId = "00000000-0000-0000-0000-000000000000";
+      const res = await app.request(`/api/tasks/${toMove.id}/move`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        body: JSON.stringify({
+          columnId: columns[1].id,
+          expectedVersion: 1,
+          prevTaskId: fakeId,
+        }),
+      });
+
+      expect(res.status).toBe(400);
+      const body = await res.json();
+      expect(body.error.code).toBe("VALIDATION_ERROR");
+      expect(body.error.message).toContain("Previous anchor task not found in destination column");
+    });
+
+    it("rejects anchor from another column with 400 VALIDATION_ERROR", async () => {
+      const { owner, project, columns } = await setupWorkspaceAndProject();
+      const col0 = columns[0];
+      const col1 = columns[1];
+
+      const c0Res = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie, "Idempotency-Key": `seed-c0-${crypto.randomUUID()}` },
+        body: JSON.stringify({ title: "T0 in Col 0", columnId: col0.id }),
+      });
+      const { task: t0 } = await c0Res.json();
+
+      const mRes = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie, "Idempotency-Key": `seed-m-${crypto.randomUUID()}` },
+        body: JSON.stringify({ title: "Move to Col 1", columnId: col0.id }),
+      });
+      const { task: toMove } = await mRes.json();
+
+      const res = await app.request(`/api/tasks/${toMove.id}/move`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        body: JSON.stringify({
+          columnId: col1.id,
+          expectedVersion: 1,
+          prevTaskId: t0.id, // t0 is in col0, not col1
+        }),
+      });
+
+      expect(res.status).toBe(400);
+      const body = await res.json();
+      expect(body.error.code).toBe("VALIDATION_ERROR");
+      expect(body.error.message).toContain("Previous anchor task not found in destination column");
+    });
+
+    it("rejects anchor from another project with 400 VALIDATION_ERROR", async () => {
+      const { owner, workspace, project, columns } = await setupWorkspaceAndProject();
+
+      // Create a second project in the workspace with a task
+      const p2Res = await app.request(`/api/workspaces/${workspace.id}/projects`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        body: JSON.stringify({ name: "Project 2" }),
+      });
+      const { project: p2, columns: p2Cols } = await p2Res.json();
+
+      const p2TaskRes = await app.request(`/api/projects/${p2.id}/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie, "Idempotency-Key": `seed-p2-${crypto.randomUUID()}` },
+        body: JSON.stringify({ title: "P2 Task", columnId: p2Cols[0].id }),
+      });
+      const { task: p2Task } = await p2TaskRes.json();
+
+      const mRes = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie, "Idempotency-Key": `seed-m-${crypto.randomUUID()}` },
+        body: JSON.stringify({ title: "Move", columnId: columns[0].id }),
+      });
+      const { task: toMove } = await mRes.json();
+
+      const res = await app.request(`/api/tasks/${toMove.id}/move`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        body: JSON.stringify({
+          columnId: columns[1].id,
+          expectedVersion: 1,
+          nextTaskId: p2Task.id,
+        }),
+      });
+
+      expect(res.status).toBe(400);
+      const body = await res.json();
+      expect(body.error.code).toBe("VALIDATION_ERROR");
+      expect(body.error.message).toContain("Next anchor task not found in destination column");
+    });
+
+    it("rejects archived anchor task with 400 VALIDATION_ERROR", async () => {
+      const { owner, project, columns } = await setupWorkspaceAndProject();
+      const col1 = columns[1];
+
+      const c1Res = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie, "Idempotency-Key": `seed-c1-${crypto.randomUUID()}` },
+        body: JSON.stringify({ title: "T1", columnId: col1.id }),
+      });
+      const { task: t1 } = await c1Res.json();
+
+      // Archive t1
+      await testDb
+        .update(tasks)
+        .set({ archivedAt: new Date() })
+        .where(eq(tasks.id, t1.id));
+
+      const mRes = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie, "Idempotency-Key": `seed-m-${crypto.randomUUID()}` },
+        body: JSON.stringify({ title: "Move", columnId: columns[0].id }),
+      });
+      const { task: toMove } = await mRes.json();
+
+      const res = await app.request(`/api/tasks/${toMove.id}/move`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        body: JSON.stringify({
+          columnId: col1.id,
+          expectedVersion: 1,
+          prevTaskId: t1.id,
+        }),
+      });
+
+      expect(res.status).toBe(400);
+      const body = await res.json();
+      expect(body.error.code).toBe("VALIDATION_ERROR");
+      expect(body.error.message).toContain("Previous anchor task not found in destination column");
+    });
+
+    it("rejects invalid UUID format for anchor tasks with 400 VALIDATION_ERROR", async () => {
+      const { owner, project, columns } = await setupWorkspaceAndProject();
+
+      const mRes = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie, "Idempotency-Key": `seed-m-${crypto.randomUUID()}` },
+        body: JSON.stringify({ title: "Move", columnId: columns[0].id }),
+      });
+      const { task: toMove } = await mRes.json();
+
+      const res = await app.request(`/api/tasks/${toMove.id}/move`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        body: JSON.stringify({
+          columnId: columns[1].id,
+          expectedVersion: 1,
+          prevTaskId: "not-a-valid-uuid",
+        }),
+      });
+
+      expect(res.status).toBe(400);
+      const body = await res.json();
+      expect(body.error.code).toBe("VALIDATION_ERROR");
+    });
+
+    // ==========================================
+    // Versioning & No-Op Semantics
+    // ==========================================
+
+    it("is an idempotent no-op when re-specifying exact current position with both anchors", async () => {
+      const { owner, project, columns } = await setupWorkspaceAndProject();
+      const col0 = columns[0];
+
+      const c1Res = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie, "Idempotency-Key": `seed-c1-${crypto.randomUUID()}` },
+        body: JSON.stringify({ title: "T1", columnId: col0.id }),
+      });
+      const { task: t1 } = await c1Res.json();
+
+      const c2Res = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie, "Idempotency-Key": `seed-c2-${crypto.randomUUID()}` },
+        body: JSON.stringify({ title: "T2", columnId: col0.id }),
+      });
+      const { task: t2 } = await c2Res.json();
+
+      const c3Res = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie, "Idempotency-Key": `seed-c3-${crypto.randomUUID()}` },
+        body: JSON.stringify({ title: "T3", columnId: col0.id }),
+      });
+      const { task: t3 } = await c3Res.json();
+
+      // Move t2 between t1 and t3 (where it already is)
+      const res = await app.request(`/api/tasks/${t2.id}/move`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        body: JSON.stringify({
+          columnId: col0.id,
+          expectedVersion: 1,
+          prevTaskId: t1.id,
+          nextTaskId: t3.id,
+        }),
+      });
+
+      expect(res.status).toBe(200);
+      const data = await res.json();
+      expect(data.task.id).toBe(t2.id);
+      expect(data.task.version).toBe(1);
+      expect(data.task.rankKey).toBe(t2.rankKey);
+      expect(data.task.updatedAt).toBe(t2.updatedAt);
+    });
+
+    it("is an idempotent no-op when moving to end with explicit prevTaskId when already last", async () => {
+      const { owner, project, columns } = await setupWorkspaceAndProject();
+      const col0 = columns[0];
+
+      const c1Res = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie, "Idempotency-Key": `seed-c1-${crypto.randomUUID()}` },
+        body: JSON.stringify({ title: "T1", columnId: col0.id }),
+      });
+      const { task: t1 } = await c1Res.json();
+
+      const c2Res = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie, "Idempotency-Key": `seed-c2-${crypto.randomUUID()}` },
+        body: JSON.stringify({ title: "T2", columnId: col0.id }),
+      });
+      const { task: t2 } = await c2Res.json();
+
+      // Move t2 after t1 (it's already last, right after t1)
+      const res = await app.request(`/api/tasks/${t2.id}/move`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        body: JSON.stringify({
+          columnId: col0.id,
+          expectedVersion: 1,
+          prevTaskId: t1.id,
+        }),
+      });
+
+      expect(res.status).toBe(200);
+      const data = await res.json();
+      expect(data.task.version).toBe(1);
+      expect(data.task.rankKey).toBe(t2.rankKey);
+      expect(data.task.updatedAt).toBe(t2.updatedAt);
+    });
+
+    it("is an idempotent no-op when moving to start with explicit nextTaskId when already first", async () => {
+      const { owner, project, columns } = await setupWorkspaceAndProject();
+      const col0 = columns[0];
+
+      const c1Res = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie, "Idempotency-Key": `seed-c1-${crypto.randomUUID()}` },
+        body: JSON.stringify({ title: "T1", columnId: col0.id }),
+      });
+      const { task: t1 } = await c1Res.json();
+
+      const c2Res = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie, "Idempotency-Key": `seed-c2-${crypto.randomUUID()}` },
+        body: JSON.stringify({ title: "T2", columnId: col0.id }),
+      });
+      const { task: t2 } = await c2Res.json();
+
+      // Move t1 before t2 (it's already first, right before t2)
+      const res = await app.request(`/api/tasks/${t1.id}/move`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        body: JSON.stringify({
+          columnId: col0.id,
+          expectedVersion: 1,
+          nextTaskId: t2.id,
+        }),
+      });
+
+      expect(res.status).toBe(200);
+      const data = await res.json();
+      expect(data.task.version).toBe(1);
+      expect(data.task.rankKey).toBe(t1.rankKey);
+      expect(data.task.updatedAt).toBe(t1.updatedAt);
+    });
+
+    // ==========================================
+    // Concurrency & Serialization
+    // ==========================================
+
+    it("serializes concurrent moves targeting the same anchor pair (one succeeds, other fails with non-adjacent 400)", async () => {
+      const { owner, project, columns } = await setupWorkspaceAndProject();
+      const col0 = columns[0];
+      const col1 = columns[1];
+
+      // Destination column has tA and tB
+      const caRes = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie, "Idempotency-Key": `seed-ca-${crypto.randomUUID()}` },
+        body: JSON.stringify({ title: "Anchor A", columnId: col1.id }),
+      });
+      const { task: tA } = await caRes.json();
+
+      const cbRes = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie, "Idempotency-Key": `seed-cb-${crypto.randomUUID()}` },
+        body: JSON.stringify({ title: "Anchor B", columnId: col1.id }),
+      });
+      const { task: tB } = await cbRes.json();
+
+      // Two candidate tasks in col0
+      const c1Res = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie, "Idempotency-Key": `seed-c1-${crypto.randomUUID()}` },
+        body: JSON.stringify({ title: "Contender 1", columnId: col0.id }),
+      });
+      const { task: t1 } = await c1Res.json();
+
+      const c2Res = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie, "Idempotency-Key": `seed-c2-${crypto.randomUUID()}` },
+        body: JSON.stringify({ title: "Contender 2", columnId: col0.id }),
+      });
+      const { task: t2 } = await c2Res.json();
+
+      // Launch both concurrently targeting the exact same anchor pair (tA, tB)
+      const [res1, res2] = await Promise.all([
+        app.request(`/api/tasks/${t1.id}/move`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+          body: JSON.stringify({
+            columnId: col1.id,
+            expectedVersion: 1,
+            prevTaskId: tA.id,
+            nextTaskId: tB.id,
+          }),
+        }),
+        app.request(`/api/tasks/${t2.id}/move`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+          body: JSON.stringify({
+            columnId: col1.id,
+            expectedVersion: 1,
+            prevTaskId: tA.id,
+            nextTaskId: tB.id,
+          }),
+        }),
+      ]);
+
+      const statuses = [res1.status, res2.status].sort();
+      expect(statuses).toEqual([200, 400]);
+
+      const errRes = res1.status === 400 ? res1 : res2;
+      const errBody = await errRes.json();
+      expect(errBody.error.code).toBe("VALIDATION_ERROR");
+      expect(errBody.error.message).toContain("Anchor tasks are not adjacent");
+
+      // Verify col1 has exactly 3 tasks: tA, winner, tB
+      const listRes = await app.request(`/api/projects/${project.id}/tasks`, {
+        headers: { Cookie: owner.cookie },
+      });
+      const listData = await listRes.json();
+      const col1Tasks = listData.tasks.filter((t: any) => t.columnId === col1.id);
+      expect(col1Tasks.length).toBe(3);
+      expect(col1Tasks[0].id).toBe(tA.id);
+      expect(col1Tasks[2].id).toBe(tB.id);
+    });
+
+    it("serializes concurrent task creation and task move in the same project without deadlock", async () => {
+      const { owner, project, columns } = await setupWorkspaceAndProject();
+      const col0 = columns[0];
+      const col1 = columns[1];
+
+      const cRes = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie, "Idempotency-Key": `seed-c-${crypto.randomUUID()}` },
+        body: JSON.stringify({ title: "Move Candidate", columnId: col0.id }),
+      });
+      const { task: toMove } = await cRes.json();
+
+      // Concurrently create a task in col0 and move toMove to col1
+      const [createRes, moveRes] = await Promise.all([
+        app.request(`/api/projects/${project.id}/tasks`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Cookie: owner.cookie,
+            "Idempotency-Key": `concurrent-create-${crypto.randomUUID()}`,
+          },
+          body: JSON.stringify({ title: "New Created Task", columnId: col0.id }),
+        }),
+        app.request(`/api/tasks/${toMove.id}/move`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+          body: JSON.stringify({
+            columnId: col1.id,
+            expectedVersion: 1,
+          }),
+        }),
+      ]);
+
+      expect(createRes.status).toBe(201);
+      expect(moveRes.status).toBe(200);
+
+      const moveData = await moveRes.json();
+      expect(moveData.task.columnId).toBe(col1.id);
+      expect(moveData.task.version).toBe(2);
+
+      // Verify DB state
+      const [movedDbTask] = await testDb
+        .select()
+        .from(tasks)
+        .where(eq(tasks.id, toMove.id));
+      expect(movedDbTask.columnId).toBe(col1.id);
+      expect(movedDbTask.version).toBe(2);
     });
   });
 
@@ -2092,6 +3119,445 @@ describe("Tasks Management, Editing, Movement & Lifecycle (Integration - Milesto
       expect(restoreRes.status).toBe(400);
       const restoreBody = await restoreRes.json();
       expect(restoreBody.error.code).toBe("VALIDATION_ERROR");
+    });
+
+    // ==========================================
+    // Collision-Safe Restoration & Concurrency (Milestone 6.5B)
+    // ==========================================
+
+    it("restores without collision preserving original rank key", async () => {
+      const { owner, project, columns } = await setupWorkspaceAndProject();
+      const col0 = columns[0];
+
+      // Create two tasks in col0
+      const c1Res = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie, "Idempotency-Key": `seed-c1-${crypto.randomUUID()}` },
+        body: JSON.stringify({ title: "Task 1", columnId: col0.id }),
+      });
+      const { task: t1 } = await c1Res.json();
+
+      const c2Res = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie, "Idempotency-Key": `seed-c2-${crypto.randomUUID()}` },
+        body: JSON.stringify({ title: "Task 2", columnId: col0.id }),
+      });
+      const { task: t2 } = await c2Res.json();
+
+      // Archive task 1
+      await app.request(`/api/tasks/${t1.id}/archive`, {
+        method: "POST",
+        headers: { Cookie: owner.cookie },
+      });
+
+      // Restore task 1 (t2 has a1, no active task has a0)
+      const res = await app.request(`/api/tasks/${t1.id}/restore`, {
+        method: "POST",
+        headers: { Cookie: owner.cookie },
+      });
+
+      expect(res.status).toBe(200);
+      const data = await res.json();
+      expect(data.task.id).toBe(t1.id);
+      expect(data.task.archivedAt).toBeNull();
+      expect(data.task.rankKey).toBe(t1.rankKey); // Preserved without change!
+      expect(data.task.version).toBe(3);
+
+      // Verify col0 active tasks have distinct rank keys
+      const listRes = await app.request(`/api/projects/${project.id}/tasks`, {
+        headers: { Cookie: owner.cookie },
+      });
+      const listData = await listRes.json();
+      const col0Tasks = listData.tasks.filter((t: any) => t.columnId === col0.id);
+      const rankKeys = col0Tasks.map((t: any) => t.rankKey);
+      expect(new Set(rankKeys).size).toBe(rankKeys.length);
+      expect(col0Tasks.map((t: any) => t.id)).toEqual([t1.id, t2.id]);
+    });
+
+    it("restores into an otherwise empty active column preserving original rank key", async () => {
+      const { owner, project, columns } = await setupWorkspaceAndProject();
+      const col0 = columns[0];
+
+      const cRes = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie, "Idempotency-Key": `seed-c-${crypto.randomUUID()}` },
+        body: JSON.stringify({ title: "Sole Task", columnId: col0.id }),
+      });
+      const { task: t } = await cRes.json();
+
+      await app.request(`/api/tasks/${t.id}/archive`, {
+        method: "POST",
+        headers: { Cookie: owner.cookie },
+      });
+
+      const res = await app.request(`/api/tasks/${t.id}/restore`, {
+        method: "POST",
+        headers: { Cookie: owner.cookie },
+      });
+
+      expect(res.status).toBe(200);
+      const data = await res.json();
+      expect(data.task.rankKey).toBe(t.rankKey);
+      expect(data.task.archivedAt).toBeNull();
+    });
+
+    it("restores with collision by appending after the last active task with a new rank key", async () => {
+      const { owner, project, columns } = await setupWorkspaceAndProject();
+      const col0 = columns[0];
+
+      // Create task 1 ("a0")
+      const c1Res = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie, "Idempotency-Key": `seed-c1-${crypto.randomUUID()}` },
+        body: JSON.stringify({ title: "Task 1", columnId: col0.id }),
+      });
+      const { task: t1 } = await c1Res.json();
+      expect(t1.rankKey).toBe("a0");
+
+      // Archive task 1
+      await app.request(`/api/tasks/${t1.id}/archive`, {
+        method: "POST",
+        headers: { Cookie: owner.cookie },
+      });
+
+      // Create task 2 in col0 (since task 1 is archived, task 2 also gets "a0")
+      const c2Res = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie, "Idempotency-Key": `seed-c2-${crypto.randomUUID()}` },
+        body: JSON.stringify({ title: "Task 2 (takes a0)", columnId: col0.id }),
+      });
+      const { task: t2 } = await c2Res.json();
+      expect(t2.rankKey).toBe("a0");
+
+      // Now restore task 1: its old rankKey ("a0") collides with active task 2 ("a0")
+      const restoreRes = await app.request(`/api/tasks/${t1.id}/restore`, {
+        method: "POST",
+        headers: { Cookie: owner.cookie },
+      });
+
+      expect(restoreRes.status).toBe(200);
+      const data = await restoreRes.json();
+      expect(data.task.id).toBe(t1.id);
+      expect(data.task.archivedAt).toBeNull();
+      // Appended after t2 ("a0"), so receives "a1"
+      expect(data.task.rankKey).toBe("a1");
+      expect(data.task.rankKey > t2.rankKey).toBe(true);
+
+      // Verify active tasks in col0 have strictly unique rank keys
+      const listRes = await app.request(`/api/projects/${project.id}/tasks`, {
+        headers: { Cookie: owner.cookie },
+      });
+      const listData = await listRes.json();
+      const col0Tasks = listData.tasks.filter((t: any) => t.columnId === col0.id);
+      const rankKeys = col0Tasks.map((t: any) => t.rankKey);
+      expect(new Set(rankKeys).size).toBe(rankKeys.length);
+      expect(col0Tasks.map((t: any) => t.id)).toEqual([t2.id, t1.id]);
+    });
+
+    it("handles move followed by restore: move occupies archived task's rank, restore appends after collision", async () => {
+      const { owner, project, columns } = await setupWorkspaceAndProject();
+      const col0 = columns[0];
+      const col1 = columns[1];
+
+      // Create task in col0
+      const c0Res = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie, "Idempotency-Key": `seed-c0-${crypto.randomUUID()}` },
+        body: JSON.stringify({ title: "Mover", columnId: col0.id }),
+      });
+      const { task: mover } = await c0Res.json();
+
+      // Create task in col1 ("a0")
+      const c1Res = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie, "Idempotency-Key": `seed-c1-${crypto.randomUUID()}` },
+        body: JSON.stringify({ title: "Col1 Native", columnId: col1.id }),
+      });
+      const { task: col1Native } = await c1Res.json();
+      expect(col1Native.rankKey).toBe("a0");
+
+      // Archive col1Native (leaving col1 empty of active tasks)
+      await app.request(`/api/tasks/${col1Native.id}/archive`, {
+        method: "POST",
+        headers: { Cookie: owner.cookie },
+      });
+
+      // Move mover into col1 (gets "a0" since col1 has 0 active tasks)
+      const moveRes = await app.request(`/api/tasks/${mover.id}/move`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        body: JSON.stringify({ columnId: col1.id, expectedVersion: 1 }),
+      });
+      expect(moveRes.status).toBe(200);
+      const moveData = await moveRes.json();
+      expect(moveData.task.rankKey).toBe("a0");
+
+      // Now restore col1Native: its old rankKey ("a0") collides with mover's "a0"
+      const restoreRes = await app.request(`/api/tasks/${col1Native.id}/restore`, {
+        method: "POST",
+        headers: { Cookie: owner.cookie },
+      });
+      expect(restoreRes.status).toBe(200);
+      const restoreData = await restoreRes.json();
+      expect(restoreData.task.rankKey).toBe("a1");
+      expect(restoreData.task.rankKey > moveData.task.rankKey).toBe(true);
+
+      // Verify col1 active tasks have distinct rank keys
+      const listRes = await app.request(`/api/projects/${project.id}/tasks`, {
+        headers: { Cookie: owner.cookie },
+      });
+      const listData = await listRes.json();
+      const col1Tasks = listData.tasks.filter((t: any) => t.columnId === col1.id);
+      const rankKeys = col1Tasks.map((t: any) => t.rankKey);
+      expect(new Set(rankKeys).size).toBe(rankKeys.length);
+      expect(col1Tasks.map((t: any) => t.id)).toEqual([mover.id, col1Native.id]);
+    });
+
+    it("handles restore followed by move: movement observes restored active task and preserves valid ordering", async () => {
+      const { owner, project, columns } = await setupWorkspaceAndProject();
+      const col0 = columns[0];
+      const col1 = columns[1];
+
+      // Col1 has t1 ("a0") and t2 ("a1")
+      const c1Res = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie, "Idempotency-Key": `seed-c1-${crypto.randomUUID()}` },
+        body: JSON.stringify({ title: "T1", columnId: col1.id }),
+      });
+      const { task: t1 } = await c1Res.json();
+
+      const c2Res = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie, "Idempotency-Key": `seed-c2-${crypto.randomUUID()}` },
+        body: JSON.stringify({ title: "T2", columnId: col1.id }),
+      });
+      const { task: t2 } = await c2Res.json();
+
+      // Archive t2
+      await app.request(`/api/tasks/${t2.id}/archive`, {
+        method: "POST",
+        headers: { Cookie: owner.cookie },
+      });
+
+      // Restore t2 (restores at "a1" without collision)
+      const restoreRes = await app.request(`/api/tasks/${t2.id}/restore`, {
+        method: "POST",
+        headers: { Cookie: owner.cookie },
+      });
+      expect(restoreRes.status).toBe(200);
+
+      // Col0 has task to move
+      const mRes = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie, "Idempotency-Key": `seed-m-${crypto.randomUUID()}` },
+        body: JSON.stringify({ title: "Mover", columnId: col0.id }),
+      });
+      const { task: mover } = await mRes.json();
+
+      // Move mover into col1 after restored t2
+      const moveRes = await app.request(`/api/tasks/${mover.id}/move`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+        body: JSON.stringify({
+          columnId: col1.id,
+          expectedVersion: 1,
+          prevTaskId: t2.id,
+        }),
+      });
+      expect(moveRes.status).toBe(200);
+      const moveData = await moveRes.json();
+      expect(moveData.task.rankKey > t2.rankKey).toBe(true);
+
+      const listRes = await app.request(`/api/projects/${project.id}/tasks`, {
+        headers: { Cookie: owner.cookie },
+      });
+      const listData = await listRes.json();
+      const col1Tasks = listData.tasks.filter((t: any) => t.columnId === col1.id);
+      const rankKeys = col1Tasks.map((t: any) => t.rankKey);
+      expect(new Set(rankKeys).size).toBe(rankKeys.length);
+      expect(col1Tasks.map((t: any) => t.id)).toEqual([t1.id, t2.id, mover.id]);
+    });
+
+    it("handles creation followed by restore: creation occupies archived task's rank, restore appends after collision", async () => {
+      const { owner, project, columns } = await setupWorkspaceAndProject();
+      const col0 = columns[0];
+
+      const c1Res = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie, "Idempotency-Key": `seed-c1-${crypto.randomUUID()}` },
+        body: JSON.stringify({ title: "T1", columnId: col0.id }),
+      });
+      const { task: t1 } = await c1Res.json();
+
+      await app.request(`/api/tasks/${t1.id}/archive`, {
+        method: "POST",
+        headers: { Cookie: owner.cookie },
+      });
+
+      // Creation occupies "a0"
+      const c2Res = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie, "Idempotency-Key": `seed-c2-${crypto.randomUUID()}` },
+        body: JSON.stringify({ title: "T2", columnId: col0.id }),
+      });
+      const { task: t2 } = await c2Res.json();
+      expect(t2.rankKey).toBe("a0");
+
+      // Restore t1
+      const restoreRes = await app.request(`/api/tasks/${t1.id}/restore`, {
+        method: "POST",
+        headers: { Cookie: owner.cookie },
+      });
+      expect(restoreRes.status).toBe(200);
+      const restoreData = await restoreRes.json();
+      expect(restoreData.task.rankKey).toBe("a1");
+
+      const listRes = await app.request(`/api/projects/${project.id}/tasks`, {
+        headers: { Cookie: owner.cookie },
+      });
+      const listData = await listRes.json();
+      const col0Tasks = listData.tasks.filter((t: any) => t.columnId === col0.id);
+      const rankKeys = col0Tasks.map((t: any) => t.rankKey);
+      expect(new Set(rankKeys).size).toBe(rankKeys.length);
+      expect(col0Tasks.map((t: any) => t.id)).toEqual([t2.id, t1.id]);
+    });
+
+    it("serializes concurrent archive and move safely without creating duplicate active rank keys", async () => {
+      const { owner, project, columns } = await setupWorkspaceAndProject();
+      const col0 = columns[0];
+      const col1 = columns[1];
+
+      // Col1 has tA ("a0") and tB ("a1")
+      const caRes = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie, "Idempotency-Key": `seed-ca-${crypto.randomUUID()}` },
+        body: JSON.stringify({ title: "Anchor A", columnId: col1.id }),
+      });
+      const { task: tA } = await caRes.json();
+
+      const cbRes = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie, "Idempotency-Key": `seed-cb-${crypto.randomUUID()}` },
+        body: JSON.stringify({ title: "Anchor B", columnId: col1.id }),
+      });
+      const { task: tB } = await cbRes.json();
+
+      // Col0 has task to move
+      const cmRes = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie, "Idempotency-Key": `seed-cm-${crypto.randomUUID()}` },
+        body: JSON.stringify({ title: "Mover", columnId: col0.id }),
+      });
+      const { task: mover } = await cmRes.json();
+
+      // Concurrently archive Anchor A and move mover between Anchor A and Anchor B
+      const [archiveRes, moveRes] = await Promise.all([
+        app.request(`/api/tasks/${tA.id}/archive`, {
+          method: "POST",
+          headers: { Cookie: owner.cookie },
+        }),
+        app.request(`/api/tasks/${mover.id}/move`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+          body: JSON.stringify({
+            columnId: col1.id,
+            expectedVersion: 1,
+            prevTaskId: tA.id,
+            nextTaskId: tB.id,
+          }),
+        }),
+      ]);
+
+      // Because both acquire project lock FOR UPDATE, they serialize:
+      // Archive succeeds (200). Move either succeeds (200, if it acquired lock first) or
+      // fails with 400 (if archive committed first and tA is no longer an active task in col1).
+      expect(archiveRes.status).toBe(200);
+      expect([200, 400]).toContain(moveRes.status);
+
+      // Verify col1 active tasks have strictly unique rank keys
+      const listRes = await app.request(`/api/projects/${project.id}/tasks`, {
+        headers: { Cookie: owner.cookie },
+      });
+      const listData = await listRes.json();
+      const col1Tasks = listData.tasks.filter((t: any) => t.columnId === col1.id);
+      const rankKeys = col1Tasks.map((t: any) => t.rankKey);
+      expect(new Set(rankKeys).size).toBe(rankKeys.length);
+    });
+
+    it("serializes concurrent restore and move safely without creating duplicate active rank keys", async () => {
+      const { owner, project, columns } = await setupWorkspaceAndProject();
+      const col0 = columns[0];
+      const col1 = columns[1];
+
+      // Col1 has tA ("a0") and tB ("a2")
+      const caRes = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie, "Idempotency-Key": `seed-ca-${crypto.randomUUID()}` },
+        body: JSON.stringify({ title: "Anchor A", columnId: col1.id }),
+      });
+      const { task: tA } = await caRes.json();
+
+      // Create tX ("a1") between tA and tB
+      const cxRes = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie, "Idempotency-Key": `seed-cx-${crypto.randomUUID()}` },
+        body: JSON.stringify({ title: "Task X", columnId: col1.id }),
+      });
+      const { task: tX } = await cxRes.json();
+
+      const cbRes = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie, "Idempotency-Key": `seed-cb-${crypto.randomUUID()}` },
+        body: JSON.stringify({ title: "Anchor B", columnId: col1.id }),
+      });
+      const { task: tB } = await cbRes.json();
+
+      // Archive tX (leaving tA "a0" and tB "a2" active)
+      await app.request(`/api/tasks/${tX.id}/archive`, {
+        method: "POST",
+        headers: { Cookie: owner.cookie },
+      });
+
+      // Col0 has task to move
+      const cmRes = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: owner.cookie, "Idempotency-Key": `seed-cm-${crypto.randomUUID()}` },
+        body: JSON.stringify({ title: "Mover", columnId: col0.id }),
+      });
+      const { task: mover } = await cmRes.json();
+
+      // Concurrently restore tX and move mover between tA and tB
+      const [restoreRes, moveRes] = await Promise.all([
+        app.request(`/api/tasks/${tX.id}/restore`, {
+          method: "POST",
+          headers: { Cookie: owner.cookie },
+        }),
+        app.request(`/api/tasks/${mover.id}/move`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+          body: JSON.stringify({
+            columnId: col1.id,
+            expectedVersion: 1,
+            prevTaskId: tA.id,
+            nextTaskId: tB.id,
+          }),
+        }),
+      ]);
+
+      // Both serialize on project lock FOR UPDATE.
+      // If restore runs first: tX is restored at "a1". When move runs, tA and tB are not adjacent (tX is between them), so move gets 400.
+      // If move runs first: move succeeds placing mover between tA and tB. When restore runs, tX detects collision with mover's key, appends after tB!
+      expect([200]).toContain(restoreRes.status);
+      expect([200, 400]).toContain(moveRes.status);
+
+      // In ALL cases, verify col1 active tasks have strictly UNIQUE rank keys
+      const listRes = await app.request(`/api/projects/${project.id}/tasks`, {
+        headers: { Cookie: owner.cookie },
+      });
+      const listData = await listRes.json();
+      const col1Tasks = listData.tasks.filter((t: any) => t.columnId === col1.id);
+      const rankKeys = col1Tasks.map((t: any) => t.rankKey);
+      expect(new Set(rankKeys).size).toBe(rankKeys.length);
     });
   });
 

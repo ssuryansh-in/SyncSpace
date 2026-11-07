@@ -42,6 +42,8 @@ const moveTaskSchema = z.object({
     .number({ required_error: "expectedVersion is required" })
     .int("expectedVersion must be an integer")
     .positive("expectedVersion must be a positive integer"),
+  prevTaskId: z.string().uuid("Invalid prevTaskId UUID").nullable().optional(),
+  nextTaskId: z.string().uuid("Invalid nextTaskId UUID").nullable().optional(),
 });
 
 export interface TaskRouteOptions {
@@ -169,6 +171,8 @@ export function createTaskRoutes(options: TaskRouteOptions): Hono {
       callerId: user.id,
       columnId: parsed.data.columnId,
       expectedVersion: parsed.data.expectedVersion,
+      prevTaskId: parsed.data.prevTaskId,
+      nextTaskId: parsed.data.nextTaskId,
     });
 
     return c.json({ task });

@@ -1,4 +1,4 @@
-import { and, asc, count, desc, eq, isNull } from "drizzle-orm";
+import { and, asc, count, desc, eq, inArray, isNull } from "drizzle-orm";
 import type { Database } from "../db/index.js";
 import { projectColumns, projects, tasks, workspaceMembers, type Task } from "../db/schema/index.js";
 import { AppError } from "../errors/index.js";
@@ -44,6 +44,8 @@ export interface MoveTaskParams {
   callerId: string;
   expectedVersion: number;
   columnId: string;
+  prevTaskId?: string | null | undefined;
+  nextTaskId?: string | null | undefined;
 }
 
 export interface ArchiveTaskParams {
@@ -493,12 +495,18 @@ export class TaskService {
   }
 
   /**
-   * Moves a task to a destination column within the same project.
+   * Moves a task to a destination column and/or position using fractional indexing anchors.
    * Requires matching expectedVersion.
-   * Same-column move is an idempotent no-op (preserves version and updatedAt).
-   * Cross-column move updates columnId, assigns deterministic rankKey, increments version, and updates updatedAt.
+   * Anchor semantics:
+   * - Both omitted/null: append to destination column.
+   * - Only prevTaskId: insert immediately after it.
+   * - Only nextTaskId: insert immediately before it.
+   * - Both supplied: insert between them (must be adjacent after excluding moving task).
+   * Same-position move in the same column is an idempotent no-op (preserves version, rankKey, and updatedAt).
+   * Genuine move updates columnId, assigns fractional rankKey, increments version, and updates updatedAt.
    * Rejects moving an archived task with 409 TASK_ARCHIVED.
    * Rejects moving a task in an archived project with 409 PROJECT_ARCHIVED.
+   * Rejects invalid/cross-project/archived/non-adjacent anchors with 400 VALIDATION_ERROR.
    */
   static async moveTask(
     db: Database,
@@ -507,30 +515,92 @@ export class TaskService {
       callerId,
       columnId,
       expectedVersion,
+      prevTaskId,
+      nextTaskId,
     }: MoveTaskParams
   ): Promise<Task> {
-    return await db.transaction(async (tx) => {
-      // 1. Lock task row and verify context
-      const { task, project } = await this.getTaskWithContext(tx, taskId, callerId, true);
+    // 0. Anchor validation: self-anchor and duplicate check
+    if (prevTaskId && prevTaskId === taskId) {
+      throw AppError.badRequest("Moving task cannot be used as its own anchor");
+    }
+    if (nextTaskId && nextTaskId === taskId) {
+      throw AppError.badRequest("Moving task cannot be used as its own anchor");
+    }
+    if (prevTaskId && nextTaskId && prevTaskId === nextTaskId) {
+      throw AppError.badRequest("Anchors must be distinct");
+    }
 
-      // 2. Reject if task is archived
-      if (task.archivedAt !== null) {
-        throw AppError.conflict("TASK_ARCHIVED", "Cannot move an archived task");
+    return await db.transaction(async (tx) => {
+      // 1. Perform an unlocked lookup of the moving task only to discover its project ID
+      const [taskSnapshot] = await tx
+        .select({ id: tasks.id, projectId: tasks.projectId })
+        .from(tasks)
+        .where(eq(tasks.id, taskId));
+
+      if (!taskSnapshot) {
+        throw AppError.notFound("Task not found");
       }
 
-      // 3. Reject if parent project is archived
+      // 2. Lock the project row using FOR UPDATE (top-level project serialization)
+      const [project] = await (tx
+        .select()
+        .from(projects)
+        .where(eq(projects.id, taskSnapshot.projectId)) as any).for("update");
+
+      if (!project) {
+        throw AppError.notFound("Task not found");
+      }
+
+      // 3. Validate caller membership and project lifecycle
+      const [callerMembership] = await tx
+        .select()
+        .from(workspaceMembers)
+        .where(
+          and(
+            eq(workspaceMembers.workspaceId, project.workspaceId),
+            eq(workspaceMembers.userId, callerId)
+          )
+        );
+
+      if (!callerMembership) {
+        // Conceal private resource existence from non-members
+        throw AppError.notFound("Task not found");
+      }
+
       if (project.archivedAt !== null) {
         throw AppError.conflict("PROJECT_ARCHIVED", "Cannot move a task in an archived project");
       }
 
-      // 4. Validate expectedVersion (stale version must be rejected even on same-column move)
+      // 4. Lock moving task and supplied anchors in ascending task ID order (deduplicating IDs)
+      const taskIdsToLock = [taskId];
+      if (prevTaskId) taskIdsToLock.push(prevTaskId);
+      if (nextTaskId) taskIdsToLock.push(nextTaskId);
+      const sortedUniqueIds = Array.from(new Set(taskIdsToLock)).sort();
+
+      const lockedTaskRows = await (tx
+        .select()
+        .from(tasks)
+        .where(inArray(tasks.id, sortedUniqueIds))
+        .orderBy(asc(tasks.id)) as any).for("update");
+
+      // 5. Re-read and validate moving task under the lock
+      const task = lockedTaskRows.find((t: Task) => t.id === taskId);
+      if (!task || task.projectId !== project.id) {
+        throw AppError.notFound("Task not found");
+      }
+
+      if (task.archivedAt !== null) {
+        throw AppError.conflict("TASK_ARCHIVED", "Cannot move an archived task");
+      }
+
+      // 6. Validate expectedVersion before evaluating no-op
       if (task.version !== expectedVersion) {
         throw AppError.conflict("VERSION_CONFLICT", "This task changed since you loaded it.", {
           currentVersion: task.version,
         });
       }
 
-      // 5. Verify destination column exists and belongs to the same project
+      // 7. Validate destination column belongs to the same project
       const [destColumn] = await tx
         .select()
         .from(projectColumns)
@@ -544,27 +614,91 @@ export class TaskService {
         throw AppError.badRequest("Column does not belong to this project");
       }
 
-      // 6. Check if same-column move (no-op in 6.2)
-      if (task.columnId === columnId) {
-        // Idempotent no-op: preserves version and updatedAt
-        return task;
+      // 8. Fetch active destination tasks ordered by rank_key ASC, id ASC
+      const destActiveTasks = await tx
+        .select({ id: tasks.id, rankKey: tasks.rankKey, columnId: tasks.columnId })
+        .from(tasks)
+        .where(
+          and(
+            eq(tasks.projectId, project.id),
+            eq(tasks.columnId, columnId),
+            isNull(tasks.archivedAt)
+          )
+        )
+        .orderBy(asc(tasks.rankKey), asc(tasks.id));
+
+      // 9. Exclude the moving task from destination ordering
+      const otherDestTasks = destActiveTasks.filter((t) => t.id !== taskId);
+
+      // 10. Validate anchors and determine effective neighboring tasks
+      let targetPrev: { id: string; rankKey: string } | null = null;
+      let targetNext: { id: string; rankKey: string } | null = null;
+
+      if (prevTaskId) {
+        const prevIndex = otherDestTasks.findIndex((t) => t.id === prevTaskId);
+        if (prevIndex === -1) {
+          throw AppError.badRequest("Previous anchor task not found in destination column");
+        }
+        targetPrev = otherDestTasks[prevIndex] ?? null;
       }
 
-      // 7. Cross-column move: generate deterministic rank key in target column
-      const [colTasksCount] = await tx
-        .select({ value: count() })
-        .from(tasks)
-        .where(and(eq(tasks.projectId, project.id), eq(tasks.columnId, columnId)));
+      if (nextTaskId) {
+        const nextIndex = otherDestTasks.findIndex((t) => t.id === nextTaskId);
+        if (nextIndex === -1) {
+          throw AppError.badRequest("Next anchor task not found in destination column");
+        }
+        targetNext = otherDestTasks[nextIndex] ?? null;
+      }
 
-      const taskIndex = colTasksCount?.value ?? 0;
-      const rankKey = `a${taskIndex.toString().padStart(5, "0")}`;
+      if (prevTaskId && nextTaskId) {
+        const prevIndex = otherDestTasks.findIndex((t) => t.id === prevTaskId);
+        const nextIndex = otherDestTasks.findIndex((t) => t.id === nextTaskId);
+        if (nextIndex !== prevIndex + 1) {
+          throw AppError.badRequest("Anchor tasks are not adjacent in destination column");
+        }
+      } else if (prevTaskId && !nextTaskId) {
+        const prevIndex = otherDestTasks.findIndex((t) => t.id === prevTaskId);
+        targetNext = prevIndex + 1 < otherDestTasks.length ? (otherDestTasks[prevIndex + 1] ?? null) : null;
+      } else if (!prevTaskId && nextTaskId) {
+        const nextIndex = otherDestTasks.findIndex((t) => t.id === nextTaskId);
+        targetPrev = nextIndex > 0 ? (otherDestTasks[nextIndex - 1] ?? null) : null;
+      } else {
+        targetPrev = otherDestTasks.length > 0 ? (otherDestTasks[otherDestTasks.length - 1] ?? null) : null;
+        targetNext = null;
+      }
 
-      // 8. Atomic update incrementing version exactly once
+      // 11. Detect no-op by comparing target neighbors with moving task's current active neighbors in same column
+      if (task.columnId === columnId) {
+        const currentIndex = destActiveTasks.findIndex((t) => t.id === taskId);
+        const currentPrev = currentIndex > 0 ? (destActiveTasks[currentIndex - 1] ?? null) : null;
+        const currentNext =
+          currentIndex >= 0 && currentIndex + 1 < destActiveTasks.length
+            ? (destActiveTasks[currentIndex + 1] ?? null)
+            : null;
+
+        const currentPrevId = currentPrev ? currentPrev.id : null;
+        const currentNextId = currentNext ? currentNext.id : null;
+        const targetPrevId = targetPrev ? targetPrev.id : null;
+        const targetNextId = targetNext ? targetNext.id : null;
+
+        if (currentPrevId === targetPrevId && currentNextId === targetNextId) {
+          // Idempotent no-op: preserve version, rankKey, and updatedAt
+          return task;
+        }
+      }
+
+      // 12. Generate fractional rank key between effective neighboring rank keys
+      const newRankKey = generateRankKey(
+        targetPrev ? targetPrev.rankKey : null,
+        targetNext ? targetNext.rankKey : null
+      );
+
+      // 13. Update task atomically incrementing version exactly once
       const [updatedTask] = await tx
         .update(tasks)
         .set({
           columnId,
-          rankKey,
+          rankKey: newRankKey,
           version: task.version + 1,
           updatedAt: new Date(),
         })
@@ -591,6 +725,7 @@ export class TaskService {
    * Active -> archived increments version and updates updatedAt.
    * Repeated archive calls on an already archived task are idempotent no-ops.
    * Rejects archiving a task in an archived project with 409 PROJECT_ARCHIVED.
+   * Follows project-first locking: workspaces -> projects -> tasks -> comments.
    */
   static async archiveTask(
     db: Database,
@@ -600,20 +735,62 @@ export class TaskService {
     }: ArchiveTaskParams
   ): Promise<Task> {
     return await db.transaction(async (tx) => {
-      // 1. Lock task row and verify context
-      const { task, project } = await this.getTaskWithContext(tx, taskId, callerId, true);
+      // 1. Perform an unlocked task lookup to discover its projectId
+      const [taskSnapshot] = await tx
+        .select({ id: tasks.id, projectId: tasks.projectId })
+        .from(tasks)
+        .where(eq(tasks.id, taskId));
 
-      // 2. Reject if parent project is archived
+      if (!taskSnapshot) {
+        throw AppError.notFound("Task not found");
+      }
+
+      // 2. Acquire project row lock (FOR UPDATE)
+      const [project] = await (tx
+        .select()
+        .from(projects)
+        .where(eq(projects.id, taskSnapshot.projectId)) as any).for("update");
+
+      if (!project) {
+        throw AppError.notFound("Task not found");
+      }
+
+      // 3. Perform existing membership and project lifecycle checks
+      const [callerMembership] = await tx
+        .select()
+        .from(workspaceMembers)
+        .where(
+          and(
+            eq(workspaceMembers.workspaceId, project.workspaceId),
+            eq(workspaceMembers.userId, callerId)
+          )
+        );
+
+      if (!callerMembership) {
+        // Conceal private resource existence from non-members
+        throw AppError.notFound("Task not found");
+      }
+
       if (project.archivedAt !== null) {
         throw AppError.conflict("PROJECT_ARCHIVED", "Cannot modify a task in an archived project");
       }
 
-      // 3. If already archived, idempotent no-op: preserve version and updatedAt
+      // 4. Acquire task row lock (FOR UPDATE)
+      const [task] = await (tx
+        .select()
+        .from(tasks)
+        .where(eq(tasks.id, taskId)) as any).for("update");
+
+      if (!task || task.projectId !== project.id) {
+        throw AppError.notFound("Task not found");
+      }
+
+      // 5. If already archived, idempotent no-op: preserve version and updatedAt
       if (task.archivedAt !== null) {
         return task;
       }
 
-      // 4. Transition from active to archived: increment version and update updatedAt
+      // 6. Transition from active to archived: increment version and update updatedAt
       const [archivedTask] = await tx
         .update(tasks)
         .set({
@@ -642,6 +819,9 @@ export class TaskService {
    * Archived -> active increments version and updates updatedAt.
    * Repeated restore calls on an already active task are idempotent no-ops.
    * Restoring into an archived project is rejected with 409 PROJECT_ARCHIVED.
+   * Follows project-first locking: workspaces -> projects -> tasks -> comments.
+   * Collision-safe: if another active task in the destination column already uses
+   * this task's rankKey, appends after the last active task with a new rankKey.
    */
   static async restoreTask(
     db: Database,
@@ -651,24 +831,101 @@ export class TaskService {
     }: RestoreTaskParams
   ): Promise<Task> {
     return await db.transaction(async (tx) => {
-      // 1. Lock task row and verify context
-      const { task, project } = await this.getTaskWithContext(tx, taskId, callerId, true);
+      // 1. Perform an unlocked task lookup to discover its projectId
+      const [taskSnapshot] = await tx
+        .select({ id: tasks.id, projectId: tasks.projectId })
+        .from(tasks)
+        .where(eq(tasks.id, taskId));
 
-      // 2. Reject if parent project is archived (cannot restore into an archived project)
+      if (!taskSnapshot) {
+        throw AppError.notFound("Task not found");
+      }
+
+      // 2. Acquire project row lock (FOR UPDATE)
+      const [project] = await (tx
+        .select()
+        .from(projects)
+        .where(eq(projects.id, taskSnapshot.projectId)) as any).for("update");
+
+      if (!project) {
+        throw AppError.notFound("Task not found");
+      }
+
+      // 3. Perform existing membership and project lifecycle checks
+      const [callerMembership] = await tx
+        .select()
+        .from(workspaceMembers)
+        .where(
+          and(
+            eq(workspaceMembers.workspaceId, project.workspaceId),
+            eq(workspaceMembers.userId, callerId)
+          )
+        );
+
+      if (!callerMembership) {
+        // Conceal private resource existence from non-members
+        throw AppError.notFound("Task not found");
+      }
+
       if (project.archivedAt !== null) {
         throw AppError.conflict("PROJECT_ARCHIVED", "Cannot restore a task in an archived project");
       }
 
-      // 3. If already active (not archived), idempotent no-op: preserve version and updatedAt
+      // 4. Acquire task row lock (FOR UPDATE)
+      const [task] = await (tx
+        .select()
+        .from(tasks)
+        .where(eq(tasks.id, taskId)) as any).for("update");
+
+      if (!task || task.projectId !== project.id) {
+        throw AppError.notFound("Task not found");
+      }
+
+      // 5. If already active (not archived), idempotent no-op: preserve version, rankKey, and updatedAt
       if (task.archivedAt === null) {
         return task;
       }
 
-      // 4. Transition from archived to active: increment version and update updatedAt
+      // 6. Collision-safe restoration: check if any active task in destination column already uses task's rankKey
+      const [collisionTask] = await tx
+        .select({ id: tasks.id })
+        .from(tasks)
+        .where(
+          and(
+            eq(tasks.projectId, project.id),
+            eq(tasks.columnId, task.columnId),
+            isNull(tasks.archivedAt),
+            eq(tasks.rankKey, task.rankKey)
+          )
+        )
+        .limit(1);
+
+      let newRankKey = task.rankKey;
+
+      if (collisionTask) {
+        // Collision exists: append restored task after the last active task in the column
+        const [lastActiveTask] = await tx
+          .select({ rankKey: tasks.rankKey })
+          .from(tasks)
+          .where(
+            and(
+              eq(tasks.projectId, project.id),
+              eq(tasks.columnId, task.columnId),
+              isNull(tasks.archivedAt)
+            )
+          )
+          .orderBy(desc(tasks.rankKey), desc(tasks.id))
+          .limit(1);
+
+        newRankKey = generateRankKey(lastActiveTask ? lastActiveTask.rankKey : null, null);
+      }
+
+      // 7. Transition from archived to active: update rankKey if changed, increment version, and update updatedAt
       const [restoredTask] = await tx
         .update(tasks)
         .set({
           archivedAt: null,
+          rankKey: newRankKey,
           version: task.version + 1,
           updatedAt: new Date(),
         })
