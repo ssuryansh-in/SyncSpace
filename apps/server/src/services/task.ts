@@ -3,6 +3,7 @@ import type { Database } from "../db/index.js";
 import { projectColumns, projects, tasks, workspaceMembers, type Task } from "../db/schema/index.js";
 import { AppError } from "../errors/index.js";
 import { computeRequestHash, IdempotencyService } from "./idempotency.js";
+import { EventService } from "./event.js";
 import {
   generateRankKey,
   generateNRankKeys,
@@ -453,7 +454,21 @@ export class TaskService {
         let rankKey = generateRankKey(lastActiveTask ? lastActiveTask.rankKey : null, null);
 
         if (rankKey.length > REBALANCE_THRESHOLD_LENGTH) {
-          await this.rebalanceColumnActiveTasks(tx, { projectId, columnId });
+          const rebalancedMap = await this.rebalanceColumnActiveTasks(tx, { projectId, columnId });
+          if (rebalancedMap.size > 0) {
+            await EventService.appendProjectEvent(tx, {
+              projectId,
+              actorId: callerId,
+              eventType: "column.rebalanced",
+              entityType: "column",
+              entityId: columnId,
+              payload: {
+                columnId,
+                rankKeyMap: Object.fromEntries(rebalancedMap),
+              },
+            });
+          }
+
           const [freshLastActive] = await tx
             .select({ rankKey: tasks.rankKey })
             .from(tasks)
@@ -490,7 +505,23 @@ export class TaskService {
           throw new Error("Failed to create task");
         }
 
-        // 10. Persist idempotency record in the same transaction
+        // 10. Append task.created domain event in the same transaction
+        const snapshot = buildTaskSnapshot(task);
+        const changes = buildTaskCreatedChanges(task);
+
+        await EventService.appendProjectEvent(tx, {
+          projectId,
+          actorId: callerId,
+          eventType: "task.created",
+          entityType: "task",
+          entityId: task.id,
+          payload: {
+            task: snapshot,
+            changes,
+          },
+        });
+
+        // 11. Persist idempotency record in the same transaction
         await IdempotencyService.save(tx, {
           actorId: callerId,
           endpointKey,
