@@ -5,6 +5,8 @@ import { createAuth } from "../../src/auth/index.js";
 import { createEmailService, clearSentEmailsForTest } from "../../src/services/email.js";
 import { loadEnv } from "../../src/config/env.js";
 import { IdempotencyService } from "../../src/services/idempotency.js";
+import { TaskService } from "../../src/services/task.js";
+import { REBALANCE_THRESHOLD_LENGTH } from "../../src/utils/fractional-indexing.js";
 import {
   users,
   workspaces,
@@ -4275,6 +4277,1074 @@ describe("Tasks Management, Editing, Movement & Lifecycle (Integration - Milesto
       expect(listData.tasks[0].rankKey).toBe("a0");
       expect(listData.tasks[1].id).toBe(data2.task.id);
       expect(listData.tasks[1].rankKey).toBe("a1");
+    });
+  });
+
+  describe("Rank-Key Column Rebalancing (Integration - Milestone 6.5C)", () => {
+    describe("Column Rebalancing Helper Behavior", () => {
+      it("rebalances active column tasks to compact fractional keys preserving order, versions, and timestamps", async () => {
+        const { owner, project, columns } = await setupWorkspaceAndProject();
+        const colId = columns[0].id;
+
+        // Seed 3 active tasks with long/irregular rank keys and distinct versions
+        const [t1] = await testDb.insert(tasks).values({
+          projectId: project.id,
+          columnId: colId,
+          title: "Task 1",
+          createdBy: owner.user.id,
+          rankKey: "a0" + "z".repeat(20),
+          version: 3,
+        }).returning();
+
+        const [t2] = await testDb.insert(tasks).values({
+          projectId: project.id,
+          columnId: colId,
+          title: "Task 2",
+          createdBy: owner.user.id,
+          rankKey: "a0" + "z".repeat(20) + "V",
+          version: 2,
+        }).returning();
+
+        const [t3] = await testDb.insert(tasks).values({
+          projectId: project.id,
+          columnId: colId,
+          title: "Task 3",
+          createdBy: owner.user.id,
+          rankKey: "b0" + "x".repeat(15),
+          version: 5,
+        }).returning();
+
+        // Run rebalancer directly within a locked project transaction
+        const rebalancedMap = await testDb.transaction(async (tx) => {
+          await (tx.select().from(projects).where(eq(projects.id, project.id)) as any).for("update");
+          return await (TaskService as any).rebalanceColumnActiveTasks(tx, {
+            projectId: project.id,
+            columnId: colId,
+          });
+        });
+
+        expect(rebalancedMap.get(t1.id)).toBe("a0");
+        expect(rebalancedMap.get(t2.id)).toBe("a1");
+        expect(rebalancedMap.get(t3.id)).toBe("a2");
+
+        // Verify persisted state in PostgreSQL
+        const [db1] = await testDb.select().from(tasks).where(eq(tasks.id, t1.id));
+        const [db2] = await testDb.select().from(tasks).where(eq(tasks.id, t2.id));
+        const [db3] = await testDb.select().from(tasks).where(eq(tasks.id, t3.id));
+
+        expect(db1.rankKey).toBe("a0");
+        expect(db1.version).toBe(3);
+        expect(db1.updatedAt.getTime()).toBe(t1.updatedAt.getTime());
+
+        expect(db2.rankKey).toBe("a1");
+        expect(db2.version).toBe(2);
+        expect(db2.updatedAt.getTime()).toBe(t2.updatedAt.getTime());
+
+        expect(db3.rankKey).toBe("a2");
+        expect(db3.version).toBe(5);
+        expect(db3.updatedAt.getTime()).toBe(t3.updatedAt.getTime());
+      });
+
+      it("excludes archived tasks, leaving their rank keys, versions, and timestamps untouched", async () => {
+        const { owner, project, columns } = await setupWorkspaceAndProject();
+        const colId = columns[0].id;
+
+        const [tActive1] = await testDb.insert(tasks).values({
+          projectId: project.id,
+          columnId: colId,
+          title: "Active 1",
+          createdBy: owner.user.id,
+          rankKey: "z".repeat(30),
+          version: 1,
+        }).returning();
+
+        const [tArchived] = await testDb.insert(tasks).values({
+          projectId: project.id,
+          columnId: colId,
+          title: "Archived Task",
+          createdBy: owner.user.id,
+          rankKey: "y999",
+          version: 4,
+          archivedAt: new Date(),
+        }).returning();
+
+        const [tActive2] = await testDb.insert(tasks).values({
+          projectId: project.id,
+          columnId: colId,
+          title: "Active 2",
+          createdBy: owner.user.id,
+          rankKey: "z".repeat(30) + "V",
+          version: 2,
+        }).returning();
+
+        await testDb.transaction(async (tx) => {
+          await (tx.select().from(projects).where(eq(projects.id, project.id)) as any).for("update");
+          await (TaskService as any).rebalanceColumnActiveTasks(tx, {
+            projectId: project.id,
+            columnId: colId,
+          });
+        });
+
+        const [dbArch] = await testDb.select().from(tasks).where(eq(tasks.id, tArchived.id));
+        expect(dbArch.rankKey).toBe("y999");
+        expect(dbArch.version).toBe(4);
+        expect(dbArch.archivedAt?.getTime()).toBe(tArchived.archivedAt?.getTime());
+        expect(dbArch.updatedAt.getTime()).toBe(tArchived.updatedAt.getTime());
+
+        const [dbAct1] = await testDb.select().from(tasks).where(eq(tasks.id, tActive1.id));
+        const [dbAct2] = await testDb.select().from(tasks).where(eq(tasks.id, tActive2.id));
+        expect(dbAct1.rankKey).toBe("a0");
+        expect(dbAct2.rankKey).toBe("a1");
+      });
+
+      it("handles empty and single-task columns cleanly without error", async () => {
+        const { project, columns } = await setupWorkspaceAndProject();
+        const colId = columns[0].id;
+
+        // Empty column
+        const emptyMap = await testDb.transaction(async (tx) => {
+          await (tx.select().from(projects).where(eq(projects.id, project.id)) as any).for("update");
+          return await (TaskService as any).rebalanceColumnActiveTasks(tx, {
+            projectId: project.id,
+            columnId: colId,
+          });
+        });
+        expect(emptyMap.size).toBe(0);
+
+        // Single task column
+        const { owner } = await setupWorkspaceAndProject("Single User", "single-col@example.com");
+        const [tSingle] = await testDb.insert(tasks).values({
+          projectId: project.id,
+          columnId: colId,
+          title: "Solo Task",
+          createdBy: owner.user.id,
+          rankKey: "m500",
+          version: 1,
+        }).returning();
+
+        const singleMap = await testDb.transaction(async (tx) => {
+          await (tx.select().from(projects).where(eq(projects.id, project.id)) as any).for("update");
+          return await (TaskService as any).rebalanceColumnActiveTasks(tx, {
+            projectId: project.id,
+            columnId: colId,
+          });
+        });
+        expect(singleMap.get(tSingle.id)).toBe("a0");
+
+        const [dbSingle] = await testDb.select().from(tasks).where(eq(tasks.id, tSingle.id));
+        expect(dbSingle.rankKey).toBe("a0");
+        expect(dbSingle.version).toBe(1);
+      });
+
+      it("skips redundant database updates when task rank keys already match the compact sequence", async () => {
+        const { owner, project, columns } = await setupWorkspaceAndProject();
+        const colId = columns[0].id;
+
+        // Seed tasks that already have keys 'a0' and 'a1'
+        const [t1] = await testDb.insert(tasks).values({
+          projectId: project.id,
+          columnId: colId,
+          title: "Already Compact 1",
+          createdBy: owner.user.id,
+          rankKey: "a0",
+          version: 1,
+        }).returning();
+
+        const [t2] = await testDb.insert(tasks).values({
+          projectId: project.id,
+          columnId: colId,
+          title: "Already Compact 2",
+          createdBy: owner.user.id,
+          rankKey: "a1",
+          version: 1,
+        }).returning();
+
+        const rebalancedMap = await testDb.transaction(async (tx) => {
+          await (tx.select().from(projects).where(eq(projects.id, project.id)) as any).for("update");
+          return await (TaskService as any).rebalanceColumnActiveTasks(tx, {
+            projectId: project.id,
+            columnId: colId,
+          });
+        });
+
+        expect(rebalancedMap.get(t1.id)).toBe("a0");
+        expect(rebalancedMap.get(t2.id)).toBe("a1");
+
+        const [db1] = await testDb.select().from(tasks).where(eq(tasks.id, t1.id));
+        const [db2] = await testDb.select().from(tasks).where(eq(tasks.id, t2.id));
+        expect(db1.rankKey).toBe("a0");
+        expect(db2.rankKey).toBe("a1");
+      });
+    });
+
+    describe("Creation-Triggered Rebalancing & Threshold Boundaries", () => {
+      it("does not trigger rebalancing when generated append candidate key length is exactly 32 (threshold boundary)", async () => {
+        const { owner, project, columns } = await setupWorkspaceAndProject();
+        const colId = columns[0].id;
+
+        // 'z'.repeat(31) produces an append key of 'z'.repeat(31) + 'V', which has length EXACTLY 32
+        const seedKey = "z".repeat(31);
+        expect(seedKey.length).toBe(31);
+
+        const [seedTask] = await testDb.insert(tasks).values({
+          projectId: project.id,
+          columnId: colId,
+          title: "Boundary Task 31",
+          createdBy: owner.user.id,
+          rankKey: seedKey,
+          version: 1,
+        }).returning();
+
+        const res = await app.request(`/api/projects/${project.id}/tasks`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Cookie: owner.cookie,
+            "Idempotency-Key": `bound-32-${crypto.randomUUID()}`,
+          },
+          body: JSON.stringify({ title: "New Boundary Task 32", columnId: colId }),
+        });
+
+        expect(res.status).toBe(201);
+        const data = await res.json();
+        expect(data.task.rankKey.length).toBe(32);
+        expect(data.task.rankKey).toBe(seedKey + "V");
+        expect(data.task.version).toBe(1);
+
+        // Verify existing task was NOT rebalanced
+        const [dbSeed] = await testDb.select().from(tasks).where(eq(tasks.id, seedTask.id));
+        expect(dbSeed.rankKey).toBe(seedKey);
+        expect(dbSeed.version).toBe(1);
+      });
+
+      it("triggers column rebalancing when generated append candidate key length exceeds 32 (length 33)", async () => {
+        const { owner, project, columns } = await setupWorkspaceAndProject();
+        const colId = columns[0].id;
+
+        // 'z'.repeat(32) produces an append key of 'z'.repeat(32) + 'V', which has length EXACTLY 33 (> 32)
+        const longKey = "z".repeat(32);
+        expect(longKey.length).toBe(32);
+
+        const [t1] = await testDb.insert(tasks).values({
+          projectId: project.id,
+          columnId: colId,
+          title: "Initial Active Task",
+          createdBy: owner.user.id,
+          rankKey: "a0",
+          version: 2,
+        }).returning();
+
+        const [t2] = await testDb.insert(tasks).values({
+          projectId: project.id,
+          columnId: colId,
+          title: "Long Key Task",
+          createdBy: owner.user.id,
+          rankKey: longKey,
+          version: 3,
+        }).returning();
+
+        const [tArch] = await testDb.insert(tasks).values({
+          projectId: project.id,
+          columnId: colId,
+          title: "Archived Unaffected Task",
+          createdBy: owner.user.id,
+          rankKey: "m999",
+          version: 1,
+          archivedAt: new Date(),
+        }).returning();
+
+        const idempKey = `create-rebal-${crypto.randomUUID()}`;
+        const res = await app.request(`/api/projects/${project.id}/tasks`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Cookie: owner.cookie,
+            "Idempotency-Key": idempKey,
+          },
+          body: JSON.stringify({ title: "Triggering Task", columnId: colId }),
+        });
+
+        expect(res.status).toBe(201);
+        const data = await res.json();
+
+        // New task appended after rebalanced tasks
+        expect(data.task.rankKey).toBe("a2");
+        expect(data.task.version).toBe(1);
+
+        // Verify existing active tasks received compact keys with versions and timestamps preserved
+        const [db1] = await testDb.select().from(tasks).where(eq(tasks.id, t1.id));
+        const [db2] = await testDb.select().from(tasks).where(eq(tasks.id, t2.id));
+        const [dbArch] = await testDb.select().from(tasks).where(eq(tasks.id, tArch.id));
+
+        expect(db1.rankKey).toBe("a0");
+        expect(db1.version).toBe(2);
+        expect(db1.updatedAt.getTime()).toBe(t1.updatedAt.getTime());
+
+        expect(db2.rankKey).toBe("a1");
+        expect(db2.version).toBe(3);
+        expect(db2.updatedAt.getTime()).toBe(t2.updatedAt.getTime());
+
+        expect(dbArch.rankKey).toBe("m999");
+        expect(dbArch.version).toBe(1);
+        expect(dbArch.archivedAt?.getTime()).toBe(tArch.archivedAt?.getTime());
+
+        // Verify list ordering
+        const listRes = await app.request(`/api/projects/${project.id}/tasks?columnId=${colId}`, {
+          headers: { Cookie: owner.cookie },
+        });
+        const listData = await listRes.json();
+        expect(listData.tasks.map((t: any) => t.id)).toEqual([t1.id, t2.id, data.task.id]);
+        expect(listData.tasks.map((t: any) => t.rankKey)).toEqual(["a0", "a1", "a2"]);
+
+        // Idempotency replay returns exact task without re-rebalancing
+        const replayRes = await app.request(`/api/projects/${project.id}/tasks`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Cookie: owner.cookie,
+            "Idempotency-Key": idempKey,
+          },
+          body: JSON.stringify({ title: "Triggering Task", columnId: colId }),
+        });
+        expect(replayRes.status).toBe(201);
+        const replayData = await replayRes.json();
+        expect(replayData.task.id).toBe(data.task.id);
+        expect(replayData.task.rankKey).toBe("a2");
+      });
+    });
+
+    describe("Movement-Triggered Rebalancing & Threshold Boundaries", () => {
+      it("does not trigger rebalancing when between-neighbor candidate key is exactly 32 characters", async () => {
+        const { owner, project, columns } = await setupWorkspaceAndProject();
+        const col0 = columns[0];
+        const col1 = columns[1];
+
+        // Between 'a0' + 'z'.repeat(29) (length 31) and 'a1': midpoint is length EXACTLY 32 ('a0' + 'z'.repeat(29) + 'V')
+        const prevKey = "a0" + "z".repeat(29);
+        expect(prevKey.length).toBe(31);
+
+        const [tPrev] = await testDb.insert(tasks).values({
+          projectId: project.id,
+          columnId: col1.id,
+          title: "Anchor Prev",
+          createdBy: owner.user.id,
+          rankKey: prevKey,
+          version: 1,
+        }).returning();
+
+        const [tNext] = await testDb.insert(tasks).values({
+          projectId: project.id,
+          columnId: col1.id,
+          title: "Anchor Next",
+          createdBy: owner.user.id,
+          rankKey: "a1",
+          version: 1,
+        }).returning();
+
+        const [tMover] = await testDb.insert(tasks).values({
+          projectId: project.id,
+          columnId: col0.id,
+          title: "Mover Task",
+          createdBy: owner.user.id,
+          rankKey: "a0",
+          version: 1,
+        }).returning();
+
+        const res = await app.request(`/api/tasks/${tMover.id}/move`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+          body: JSON.stringify({
+            columnId: col1.id,
+            expectedVersion: 1,
+            prevTaskId: tPrev.id,
+            nextTaskId: tNext.id,
+          }),
+        });
+
+        expect(res.status).toBe(200);
+        const data = await res.json();
+        expect(data.task.rankKey.length).toBe(32);
+        expect(data.task.rankKey).toBe(prevKey + "V");
+        expect(data.task.version).toBe(2);
+
+        // Anchors retain their keys and versions
+        const [dbPrev] = await testDb.select().from(tasks).where(eq(tasks.id, tPrev.id));
+        const [dbNext] = await testDb.select().from(tasks).where(eq(tasks.id, tNext.id));
+        expect(dbPrev.rankKey).toBe(prevKey);
+        expect(dbPrev.version).toBe(1);
+        expect(dbNext.rankKey).toBe("a1");
+        expect(dbNext.version).toBe(1);
+      });
+
+      it("triggers rebalancing on same-column movement between two anchors when candidate key exceeds 32 characters", async () => {
+        const { owner, project, columns } = await setupWorkspaceAndProject();
+        const colId = columns[0].id;
+
+        // Between 'a0' + 'z'.repeat(30) (length 32) and 'a1': midpoint is length 33 (> 32)
+        const prevKey = "a0" + "z".repeat(30);
+        expect(prevKey.length).toBe(32);
+
+        const [tA] = await testDb.insert(tasks).values({
+          projectId: project.id,
+          columnId: colId,
+          title: "Task A",
+          createdBy: owner.user.id,
+          rankKey: "a0",
+          version: 1,
+        }).returning();
+
+        const [tB] = await testDb.insert(tasks).values({
+          projectId: project.id,
+          columnId: colId,
+          title: "Task B",
+          createdBy: owner.user.id,
+          rankKey: prevKey,
+          version: 2,
+        }).returning();
+
+        const [tC] = await testDb.insert(tasks).values({
+          projectId: project.id,
+          columnId: colId,
+          title: "Task C",
+          createdBy: owner.user.id,
+          rankKey: "a1",
+          version: 1,
+        }).returning();
+
+        const [tMover] = await testDb.insert(tasks).values({
+          projectId: project.id,
+          columnId: colId,
+          title: "Task Mover",
+          createdBy: owner.user.id,
+          rankKey: "a2",
+          version: 1,
+        }).returning();
+
+        // Move tMover between tB and tC
+        const res = await app.request(`/api/tasks/${tMover.id}/move`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+          body: JSON.stringify({
+            columnId: colId,
+            expectedVersion: 1,
+            prevTaskId: tB.id,
+            nextTaskId: tC.id,
+          }),
+        });
+
+        expect(res.status).toBe(200);
+        const data = await res.json();
+
+        // tMover should increment version to 2
+        expect(data.task.version).toBe(2);
+
+        // In DB: tMover excluded from destination column rebalance, so tA, tB, tC become a0, a1, a2
+        // Then tMover is placed between tB (now a1) and tC (now a2) -> 'a1V'
+        const [dbA] = await testDb.select().from(tasks).where(eq(tasks.id, tA.id));
+        const [dbB] = await testDb.select().from(tasks).where(eq(tasks.id, tB.id));
+        const [dbC] = await testDb.select().from(tasks).where(eq(tasks.id, tC.id));
+        const [dbMover] = await testDb.select().from(tasks).where(eq(tasks.id, tMover.id));
+
+        expect(dbA.rankKey).toBe("a0");
+        expect(dbA.version).toBe(1);
+        expect(dbA.updatedAt.getTime()).toBe(tA.updatedAt.getTime());
+
+        expect(dbB.rankKey).toBe("a1");
+        expect(dbB.version).toBe(2);
+        expect(dbB.updatedAt.getTime()).toBe(tB.updatedAt.getTime());
+
+        expect(dbC.rankKey).toBe("a2");
+        expect(dbC.version).toBe(1);
+        expect(dbC.updatedAt.getTime()).toBe(tC.updatedAt.getTime());
+
+        expect(dbMover.rankKey).toBe("a1V");
+        expect(dbMover.version).toBe(2);
+
+        // Logical ordering verification
+        const listRes = await app.request(`/api/projects/${project.id}/tasks?columnId=${colId}`, {
+          headers: { Cookie: owner.cookie },
+        });
+        const listData = await listRes.json();
+        expect(listData.tasks.map((t: any) => t.id)).toEqual([tA.id, tB.id, tMover.id, tC.id]);
+        expect(listData.tasks.map((t: any) => t.rankKey)).toEqual(["a0", "a1", "a1V", "a2"]);
+      });
+
+      it("triggers rebalancing on prepending when candidate key exceeds 32 characters", async () => {
+        const { owner, project, columns } = await setupWorkspaceAndProject();
+        const col0 = columns[0];
+        const col1 = columns[1];
+
+        // Seed task in col1 with a key that makes prepending exceed 32 chars:
+        // 'A' + '0'.repeat(31) + 'V' has length 33
+        const firstKey = "A" + "0".repeat(31) + "V";
+        expect(firstKey.length).toBe(33);
+
+        const [tFirst] = await testDb.insert(tasks).values({
+          projectId: project.id,
+          columnId: col1.id,
+          title: "First Task with Long Key",
+          createdBy: owner.user.id,
+          rankKey: firstKey,
+          version: 1,
+        }).returning();
+
+        const [tMover] = await testDb.insert(tasks).values({
+          projectId: project.id,
+          columnId: col0.id,
+          title: "Prepending Mover",
+          createdBy: owner.user.id,
+          rankKey: "a0",
+          version: 1,
+        }).returning();
+
+        const res = await app.request(`/api/tasks/${tMover.id}/move`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+          body: JSON.stringify({
+            columnId: col1.id,
+            expectedVersion: 1,
+            nextTaskId: tFirst.id,
+          }),
+        });
+
+        expect(res.status).toBe(200);
+        const data = await res.json();
+        expect(data.task.version).toBe(2);
+
+        // Rebalanced tFirst -> a0. Prepend before a0 gives Zz
+        const [dbFirst] = await testDb.select().from(tasks).where(eq(tasks.id, tFirst.id));
+        const [dbMover] = await testDb.select().from(tasks).where(eq(tasks.id, tMover.id));
+
+        expect(dbFirst.rankKey).toBe("a0");
+        expect(dbFirst.version).toBe(1);
+        expect(dbMover.rankKey).toBe("Zz");
+        expect(dbMover.rankKey < dbFirst.rankKey).toBe(true);
+
+        const listRes = await app.request(`/api/projects/${project.id}/tasks?columnId=${col1.id}`, {
+          headers: { Cookie: owner.cookie },
+        });
+        const listData = await listRes.json();
+        expect(listData.tasks.map((t: any) => t.id)).toEqual([tMover.id, tFirst.id]);
+      });
+
+      it("rebalances destination column only on cross-column movement, leaving source column intact", async () => {
+        const { owner, project, columns } = await setupWorkspaceAndProject();
+        const col0 = columns[0];
+        const col1 = columns[1];
+
+        const [sourceTask] = await testDb.insert(tasks).values({
+          projectId: project.id,
+          columnId: col0.id,
+          title: "Source Stable Task",
+          createdBy: owner.user.id,
+          rankKey: "z".repeat(30),
+          version: 4,
+        }).returning();
+
+        const [tMover] = await testDb.insert(tasks).values({
+          projectId: project.id,
+          columnId: col0.id,
+          title: "Cross Column Mover",
+          createdBy: owner.user.id,
+          rankKey: "z".repeat(30) + "V",
+          version: 1,
+        }).returning();
+
+        const [destTask] = await testDb.insert(tasks).values({
+          projectId: project.id,
+          columnId: col1.id,
+          title: "Dest Task Triggering Rebalance",
+          createdBy: owner.user.id,
+          rankKey: "z".repeat(32),
+          version: 2,
+        }).returning();
+
+        // Move tMover to col1 (append)
+        const res = await app.request(`/api/tasks/${tMover.id}/move`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+          body: JSON.stringify({
+            columnId: col1.id,
+            expectedVersion: 1,
+          }),
+        });
+
+        expect(res.status).toBe(200);
+
+        // Destination column rebalanced
+        const [dbDest] = await testDb.select().from(tasks).where(eq(tasks.id, destTask.id));
+        const [dbMover] = await testDb.select().from(tasks).where(eq(tasks.id, tMover.id));
+        expect(dbDest.rankKey).toBe("a0");
+        expect(dbDest.version).toBe(2);
+        expect(dbMover.rankKey).toBe("a1");
+        expect(dbMover.version).toBe(2);
+
+        // Source column unchanged
+        const [dbSource] = await testDb.select().from(tasks).where(eq(tasks.id, sourceTask.id));
+        expect(dbSource.rankKey).toBe("z".repeat(30));
+        expect(dbSource.version).toBe(4);
+        expect(dbSource.updatedAt.getTime()).toBe(sourceTask.updatedAt.getTime());
+      });
+
+      it("same-column no-op move does not trigger rebalancing even if candidate would exceed 32 characters", async () => {
+        const { owner, project, columns } = await setupWorkspaceAndProject();
+        const colId = columns[0].id;
+
+        const [tA] = await testDb.insert(tasks).values({
+          projectId: project.id,
+          columnId: colId,
+          title: "Task A",
+          createdBy: owner.user.id,
+          rankKey: "a0" + "z".repeat(30),
+          version: 1,
+        }).returning();
+
+        const [tMover] = await testDb.insert(tasks).values({
+          projectId: project.id,
+          columnId: colId,
+          title: "Task Middle",
+          createdBy: owner.user.id,
+          rankKey: "a0" + "z".repeat(30) + "V",
+          version: 1,
+        }).returning();
+
+        const [tB] = await testDb.insert(tasks).values({
+          projectId: project.id,
+          columnId: colId,
+          title: "Task B",
+          createdBy: owner.user.id,
+          rankKey: "a1",
+          version: 1,
+        }).returning();
+
+        // Move tMover to its exact same position between tA and tB
+        const res = await app.request(`/api/tasks/${tMover.id}/move`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+          body: JSON.stringify({
+            columnId: colId,
+            expectedVersion: 1,
+            prevTaskId: tA.id,
+            nextTaskId: tB.id,
+          }),
+        });
+
+        expect(res.status).toBe(200);
+        const data = await res.json();
+        expect(data.task.id).toBe(tMover.id);
+        expect(data.task.version).toBe(1);
+        expect(data.task.rankKey).toBe(tMover.rankKey);
+
+        // Zero tasks were rebalanced
+        const [dbA] = await testDb.select().from(tasks).where(eq(tasks.id, tA.id));
+        const [dbMover] = await testDb.select().from(tasks).where(eq(tasks.id, tMover.id));
+        const [dbB] = await testDb.select().from(tasks).where(eq(tasks.id, tB.id));
+        expect(dbA.rankKey).toBe(tA.rankKey);
+        expect(dbMover.rankKey).toBe(tMover.rankKey);
+        expect(dbB.rankKey).toBe(tB.rankKey);
+      });
+    });
+
+    describe("Restoration-Triggered Rebalancing", () => {
+      it("restores task preserving original rank key when no collision exists (no rebalance)", async () => {
+        const { owner, project, columns } = await setupWorkspaceAndProject();
+        const colId = columns[0].id;
+
+        const [t1] = await testDb.insert(tasks).values({
+          projectId: project.id,
+          columnId: colId,
+          title: "Task 1",
+          createdBy: owner.user.id,
+          rankKey: "a0",
+          version: 1,
+        }).returning();
+
+        const [tArchived] = await testDb.insert(tasks).values({
+          projectId: project.id,
+          columnId: colId,
+          title: "Archived Task",
+          createdBy: owner.user.id,
+          rankKey: "a1",
+          version: 1,
+          archivedAt: new Date(),
+        }).returning();
+
+        const [t3] = await testDb.insert(tasks).values({
+          projectId: project.id,
+          columnId: colId,
+          title: "Task 3",
+          createdBy: owner.user.id,
+          rankKey: "a2",
+          version: 1,
+        }).returning();
+
+        const res = await app.request(`/api/tasks/${tArchived.id}/restore`, {
+          method: "POST",
+          headers: { Cookie: owner.cookie },
+        });
+
+        expect(res.status).toBe(200);
+        const data = await res.json();
+        expect(data.task.rankKey).toBe("a1");
+        expect(data.task.archivedAt).toBeNull();
+        expect(data.task.version).toBe(2);
+
+        // Verify ordering in column
+        const listRes = await app.request(`/api/projects/${project.id}/tasks?columnId=${colId}`, {
+          headers: { Cookie: owner.cookie },
+        });
+        const listData = await listRes.json();
+        expect(listData.tasks.map((t: any) => t.id)).toEqual([t1.id, tArchived.id, t3.id]);
+        expect(listData.tasks.map((t: any) => t.rankKey)).toEqual(["a0", "a1", "a2"]);
+      });
+
+      it("appends on collision without rebalance when append candidate length is <= 32", async () => {
+        const { owner, project, columns } = await setupWorkspaceAndProject();
+        const colId = columns[0].id;
+
+        const [tActive] = await testDb.insert(tasks).values({
+          projectId: project.id,
+          columnId: colId,
+          title: "Active Task",
+          createdBy: owner.user.id,
+          rankKey: "a0",
+          version: 1,
+        }).returning();
+
+        const [tArchived] = await testDb.insert(tasks).values({
+          projectId: project.id,
+          columnId: colId,
+          title: "Colliding Archived Task",
+          createdBy: owner.user.id,
+          rankKey: "a0",
+          version: 1,
+          archivedAt: new Date(),
+        }).returning();
+
+        const res = await app.request(`/api/tasks/${tArchived.id}/restore`, {
+          method: "POST",
+          headers: { Cookie: owner.cookie },
+        });
+
+        expect(res.status).toBe(200);
+        const data = await res.json();
+        expect(data.task.rankKey).toBe("a1");
+        expect(data.task.version).toBe(2);
+
+        const [dbActive] = await testDb.select().from(tasks).where(eq(tasks.id, tActive.id));
+        expect(dbActive.rankKey).toBe("a0");
+        expect(dbActive.version).toBe(1);
+      });
+
+      it("triggers column rebalancing on collision when append candidate length exceeds 32", async () => {
+        const { owner, project, columns } = await setupWorkspaceAndProject();
+        const colId = columns[0].id;
+
+        const [tActive1] = await testDb.insert(tasks).values({
+          projectId: project.id,
+          columnId: colId,
+          title: "Active Task 1",
+          createdBy: owner.user.id,
+          rankKey: "a0",
+          version: 2,
+        }).returning();
+
+        const [tActive2] = await testDb.insert(tasks).values({
+          projectId: project.id,
+          columnId: colId,
+          title: "Active Task Long",
+          createdBy: owner.user.id,
+          rankKey: "z".repeat(32),
+          version: 3,
+        }).returning();
+
+        const [tArchived] = await testDb.insert(tasks).values({
+          projectId: project.id,
+          columnId: colId,
+          title: "Archived Colliding Task",
+          createdBy: owner.user.id,
+          rankKey: "a0",
+          version: 1,
+          archivedAt: new Date(),
+        }).returning();
+
+        const res = await app.request(`/api/tasks/${tArchived.id}/restore`, {
+          method: "POST",
+          headers: { Cookie: owner.cookie },
+        });
+
+        expect(res.status).toBe(200);
+        const data = await res.json();
+        expect(data.task.version).toBe(2);
+        expect(data.task.archivedAt).toBeNull();
+        expect(data.task.rankKey).toBe("a2");
+
+        // Existing tasks preserved
+        const [db1] = await testDb.select().from(tasks).where(eq(tasks.id, tActive1.id));
+        const [db2] = await testDb.select().from(tasks).where(eq(tasks.id, tActive2.id));
+        expect(db1.rankKey).toBe("a0");
+        expect(db1.version).toBe(2);
+        expect(db1.updatedAt.getTime()).toBe(tActive1.updatedAt.getTime());
+
+        expect(db2.rankKey).toBe("a1");
+        expect(db2.version).toBe(3);
+        expect(db2.updatedAt.getTime()).toBe(tActive2.updatedAt.getTime());
+
+        // Repeated restore is idempotent no-op
+        const repeatRes = await app.request(`/api/tasks/${tArchived.id}/restore`, {
+          method: "POST",
+          headers: { Cookie: owner.cookie },
+        });
+        expect(repeatRes.status).toBe(200);
+        const repeatData = await repeatRes.json();
+        expect(repeatData.task.version).toBe(2);
+        expect(repeatData.task.rankKey).toBe("a2");
+      });
+    });
+
+    describe("Rollback & Transaction Atomicity", () => {
+      it("rolls back all rebalanced keys, task mutations, and version changes if transaction fails before commit", async () => {
+        const { owner, project, columns } = await setupWorkspaceAndProject();
+        const colId = columns[0].id;
+
+        const [t1] = await testDb.insert(tasks).values({
+          projectId: project.id,
+          columnId: colId,
+          title: "Task Stable A",
+          createdBy: owner.user.id,
+          rankKey: "a0",
+          version: 2,
+        }).returning();
+
+        const [t2] = await testDb.insert(tasks).values({
+          projectId: project.id,
+          columnId: colId,
+          title: "Task Long B",
+          createdBy: owner.user.id,
+          rankKey: "z".repeat(32),
+          version: 3,
+        }).returning();
+
+        // Wrap testDb.transaction to trigger rebalance and then throw before commit
+        const failingDb = {
+          ...testDb,
+          transaction: async (cb: any) => {
+            return await testDb.transaction(async (tx) => {
+              await cb(tx);
+              throw new Error("Simulated transactional rollback after rebalance");
+            });
+          },
+        } as any;
+
+        await expect(
+          TaskService.createTask(failingDb, {
+            projectId: project.id,
+            callerId: owner.user.id,
+            title: "Doomed Task",
+            columnId: colId,
+            idempotencyKey: `fail-rebal-${crypto.randomUUID()}`,
+            requestPath: `/api/projects/${project.id}/tasks`,
+          })
+        ).rejects.toThrow("Simulated transactional rollback after rebalance");
+
+        // Verify PostgreSQL state: everything rolled back completely
+        const [db1] = await testDb.select().from(tasks).where(eq(tasks.id, t1.id));
+        const [db2] = await testDb.select().from(tasks).where(eq(tasks.id, t2.id));
+
+        expect(db1.rankKey).toBe("a0");
+        expect(db1.version).toBe(2);
+
+        expect(db2.rankKey).toBe("z".repeat(32));
+        expect(db2.version).toBe(3);
+
+        const allTasks = await testDb.select().from(tasks).where(eq(tasks.projectId, project.id));
+        expect(allTasks).toHaveLength(2);
+      });
+    });
+
+    describe("Concurrency and Rebalancing Serialization", () => {
+      it("handles concurrent task creation with rebalancing producing strictly distinct sequential rank keys and deterministic order", async () => {
+        const { owner, project, columns } = await setupWorkspaceAndProject();
+        const colId = columns[0].id;
+
+        // Column has task with long key that will trigger rebalance on append
+        await testDb.insert(tasks).values({
+          projectId: project.id,
+          columnId: colId,
+          title: "Existing Long Task",
+          createdBy: owner.user.id,
+          rankKey: "z".repeat(32),
+          version: 1,
+        });
+
+        // Two concurrent creation requests
+        const [res1, res2] = await Promise.all([
+          app.request(`/api/projects/${project.id}/tasks`, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              Cookie: owner.cookie,
+              "Idempotency-Key": `conc-rebal-1-${crypto.randomUUID()}`,
+            },
+            body: JSON.stringify({ title: "Concurrent Rebal 1", columnId: colId }),
+          }),
+          app.request(`/api/projects/${project.id}/tasks`, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              Cookie: owner.cookie,
+              "Idempotency-Key": `conc-rebal-2-${crypto.randomUUID()}`,
+            },
+            body: JSON.stringify({ title: "Concurrent Rebal 2", columnId: colId }),
+          }),
+        ]);
+
+        expect(res1.status).toBe(201);
+        expect(res2.status).toBe(201);
+
+        const listRes = await app.request(`/api/projects/${project.id}/tasks?columnId=${colId}`, {
+          headers: { Cookie: owner.cookie },
+        });
+        const listData = await listRes.json();
+        expect(listData.tasks).toHaveLength(3);
+
+        const rankKeys = listData.tasks.map((t: any) => t.rankKey);
+        expect(new Set(rankKeys).size).toBe(3);
+        expect(rankKeys).toEqual(["a0", "a1", "a2"]);
+      });
+
+      it("handles concurrent movement into a column requiring rebalance", async () => {
+        const { owner, project, columns } = await setupWorkspaceAndProject();
+        const col0 = columns[0];
+        const col1 = columns[1];
+
+        // Seed destination column with task that triggers rebalance on append
+        await testDb.insert(tasks).values({
+          projectId: project.id,
+          columnId: col1.id,
+          title: "Dest Long Task",
+          createdBy: owner.user.id,
+          rankKey: "z".repeat(32),
+          version: 1,
+        });
+
+        // Seed two mover tasks in col0
+        const [mover1] = await testDb.insert(tasks).values({
+          projectId: project.id,
+          columnId: col0.id,
+          title: "Mover 1",
+          createdBy: owner.user.id,
+          rankKey: "a0",
+          version: 1,
+        }).returning();
+
+        const [mover2] = await testDb.insert(tasks).values({
+          projectId: project.id,
+          columnId: col0.id,
+          title: "Mover 2",
+          createdBy: owner.user.id,
+          rankKey: "a1",
+          version: 1,
+        }).returning();
+
+        // Concurrently move both into col1 (appended)
+        const [moveRes1, moveRes2] = await Promise.all([
+          app.request(`/api/tasks/${mover1.id}/move`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+            body: JSON.stringify({ columnId: col1.id, expectedVersion: 1 }),
+          }),
+          app.request(`/api/tasks/${mover2.id}/move`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+            body: JSON.stringify({ columnId: col1.id, expectedVersion: 1 }),
+          }),
+        ]);
+
+        expect(moveRes1.status).toBe(200);
+        expect(moveRes2.status).toBe(200);
+
+        const listRes = await app.request(`/api/projects/${project.id}/tasks?columnId=${col1.id}`, {
+          headers: { Cookie: owner.cookie },
+        });
+        const listData = await listRes.json();
+        expect(listData.tasks).toHaveLength(3);
+
+        const rankKeys = listData.tasks.map((t: any) => t.rankKey);
+        expect(new Set(rankKeys).size).toBe(3);
+        expect(rankKeys).toEqual(["a0", "a1", "a2"]);
+      });
+
+      it("handles concurrent restoration and move where restoration triggers rebalance", async () => {
+        const { owner, project, columns } = await setupWorkspaceAndProject();
+        const col0 = columns[0];
+        const col1 = columns[1];
+
+        // Destination column col1 has an active task and an active task with long key
+        await testDb.insert(tasks).values({
+          projectId: project.id,
+          columnId: col1.id,
+          title: "Dest Task 1",
+          createdBy: owner.user.id,
+          rankKey: "a0",
+          version: 1,
+        });
+
+        await testDb.insert(tasks).values({
+          projectId: project.id,
+          columnId: col1.id,
+          title: "Dest Long Task",
+          createdBy: owner.user.id,
+          rankKey: "z".repeat(32),
+          version: 1,
+        });
+
+        // Archived task in col1 with rankKey 'a0' (will collide with Dest Task 1)
+        const [tArchived] = await testDb.insert(tasks).values({
+          projectId: project.id,
+          columnId: col1.id,
+          title: "Archived Colliding",
+          createdBy: owner.user.id,
+          rankKey: "a0",
+          version: 1,
+          archivedAt: new Date(),
+        }).returning();
+
+        // Mover in col0
+        const [mover] = await testDb.insert(tasks).values({
+          projectId: project.id,
+          columnId: col0.id,
+          title: "Col0 Mover",
+          createdBy: owner.user.id,
+          rankKey: "a0",
+          version: 1,
+        }).returning();
+
+        // Concurrently restore tArchived (triggers rebalance) and move mover to col1
+        const [restoreRes, moveRes] = await Promise.all([
+          app.request(`/api/tasks/${tArchived.id}/restore`, {
+            method: "POST",
+            headers: { Cookie: owner.cookie },
+          }),
+          app.request(`/api/tasks/${mover.id}/move`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json", Cookie: owner.cookie },
+            body: JSON.stringify({ columnId: col1.id, expectedVersion: 1 }),
+          }),
+        ]);
+
+        expect(restoreRes.status).toBe(200);
+        expect(moveRes.status).toBe(200);
+
+        const listRes = await app.request(`/api/projects/${project.id}/tasks?columnId=${col1.id}`, {
+          headers: { Cookie: owner.cookie },
+        });
+        const listData = await listRes.json();
+        expect(listData.tasks).toHaveLength(4);
+
+        const rankKeys = listData.tasks.map((t: any) => t.rankKey);
+        expect(new Set(rankKeys).size).toBe(4);
+      });
     });
   });
 });

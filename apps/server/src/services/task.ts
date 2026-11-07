@@ -1,9 +1,13 @@
-import { and, asc, count, desc, eq, inArray, isNull } from "drizzle-orm";
+import { and, asc, count, desc, eq, inArray, isNull, ne } from "drizzle-orm";
 import type { Database } from "../db/index.js";
 import { projectColumns, projects, tasks, workspaceMembers, type Task } from "../db/schema/index.js";
 import { AppError } from "../errors/index.js";
 import { computeRequestHash, IdempotencyService } from "./idempotency.js";
-import { generateRankKey } from "../utils/fractional-indexing.js";
+import {
+  generateRankKey,
+  generateNRankKeys,
+  REBALANCE_THRESHOLD_LENGTH,
+} from "../utils/fractional-indexing.js";
 
 export interface CreateTaskParams {
   projectId: string;
@@ -113,6 +117,73 @@ export class TaskService {
     }
 
     return { task, project, membership };
+  }
+
+  /**
+   * Rebalances fractional rank keys of active tasks within a specific column.
+   * Triggered when a newly generated candidate rank key exceeds REBALANCE_THRESHOLD_LENGTH (32 chars).
+   * - Only active tasks (archivedAt IS NULL) in destination column are rebalanced.
+   * - Optionally excludes a moving task (excludeTaskId) so its intermediate state does not interfere.
+   * - Locks all affected task rows in ascending ID order within the caller's project-locked transaction.
+   * - Preserves existing task versions and timestamps (only rankKey is updated).
+   * - Returns a mapping of taskId -> newRankKey so callers can immediately resolve fresh anchor rank keys.
+   */
+  private static async rebalanceColumnActiveTasks(
+    tx: Database,
+    {
+      projectId,
+      columnId,
+      excludeTaskId,
+    }: {
+      projectId: string;
+      columnId: string;
+      excludeTaskId?: string | undefined;
+    }
+  ): Promise<Map<string, string>> {
+    const conditions = [
+      eq(tasks.projectId, projectId),
+      eq(tasks.columnId, columnId),
+      isNull(tasks.archivedAt),
+    ];
+
+    if (excludeTaskId) {
+      conditions.push(ne(tasks.id, excludeTaskId));
+    }
+
+    const activeTasks = await tx
+      .select({ id: tasks.id, rankKey: tasks.rankKey })
+      .from(tasks)
+      .where(and(...conditions))
+      .orderBy(asc(tasks.rankKey), asc(tasks.id));
+
+    if (activeTasks.length === 0) {
+      return new Map();
+    }
+
+    const sortedTaskIds = activeTasks.map((t) => t.id).sort();
+    await (tx
+      .select({ id: tasks.id })
+      .from(tasks)
+      .where(inArray(tasks.id, sortedTaskIds))
+      .orderBy(asc(tasks.id)) as any).for("update");
+
+    const newKeys = generateNRankKeys(null, null, activeTasks.length);
+    const rebalancedMap = new Map<string, string>();
+
+    for (let i = 0; i < activeTasks.length; i++) {
+      const task = activeTasks[i]!;
+      const newKey = newKeys[i]!;
+      rebalancedMap.set(task.id, newKey);
+
+      if (task.rankKey !== newKey) {
+        await tx
+          .update(tasks)
+          .set({ rankKey: newKey })
+          .where(eq(tasks.id, task.id));
+      }
+    }
+
+    return rebalancedMap;
   }
 
   /**
@@ -242,7 +313,25 @@ export class TaskService {
           .orderBy(desc(tasks.rankKey), desc(tasks.id))
           .limit(1);
 
-        const rankKey = generateRankKey(lastActiveTask ? lastActiveTask.rankKey : null, null);
+        let rankKey = generateRankKey(lastActiveTask ? lastActiveTask.rankKey : null, null);
+
+        if (rankKey.length > REBALANCE_THRESHOLD_LENGTH) {
+          await this.rebalanceColumnActiveTasks(tx, { projectId, columnId });
+          const [freshLastActive] = await tx
+            .select({ rankKey: tasks.rankKey })
+            .from(tasks)
+            .where(
+              and(
+                eq(tasks.projectId, projectId),
+                eq(tasks.columnId, columnId),
+                isNull(tasks.archivedAt)
+              )
+            )
+            .orderBy(desc(tasks.rankKey), desc(tasks.id))
+            .limit(1);
+
+          rankKey = generateRankKey(freshLastActive ? freshLastActive.rankKey : null, null);
+        }
 
         // 9. Insert task row
         const [task] = await tx
@@ -688,10 +777,27 @@ export class TaskService {
       }
 
       // 12. Generate fractional rank key between effective neighboring rank keys
-      const newRankKey = generateRankKey(
+      let newRankKey = generateRankKey(
         targetPrev ? targetPrev.rankKey : null,
         targetNext ? targetNext.rankKey : null
       );
+
+      if (newRankKey.length > REBALANCE_THRESHOLD_LENGTH) {
+        const rebalancedMap = await this.rebalanceColumnActiveTasks(tx, {
+          projectId: project.id,
+          columnId,
+          excludeTaskId: taskId,
+        });
+
+        const freshPrevRank = targetPrev
+          ? (rebalancedMap.get(targetPrev.id) ?? targetPrev.rankKey)
+          : null;
+        const freshNextRank = targetNext
+          ? (rebalancedMap.get(targetNext.id) ?? targetNext.rankKey)
+          : null;
+
+        newRankKey = generateRankKey(freshPrevRank, freshNextRank);
+      }
 
       // 13. Update task atomically incrementing version exactly once
       const [updatedTask] = await tx
@@ -918,6 +1024,29 @@ export class TaskService {
           .limit(1);
 
         newRankKey = generateRankKey(lastActiveTask ? lastActiveTask.rankKey : null, null);
+
+        if (newRankKey.length > REBALANCE_THRESHOLD_LENGTH) {
+          await this.rebalanceColumnActiveTasks(tx, {
+            projectId: project.id,
+            columnId: task.columnId,
+            excludeTaskId: taskId,
+          });
+
+          const [freshLastActive] = await tx
+            .select({ rankKey: tasks.rankKey })
+            .from(tasks)
+            .where(
+              and(
+                eq(tasks.projectId, project.id),
+                eq(tasks.columnId, task.columnId),
+                isNull(tasks.archivedAt)
+              )
+            )
+            .orderBy(desc(tasks.rankKey), desc(tasks.id))
+            .limit(1);
+
+          newRankKey = generateRankKey(freshLastActive ? freshLastActive.rankKey : null, null);
+        }
       }
 
       // 7. Transition from archived to active: update rankKey if changed, increment version, and update updatedAt
