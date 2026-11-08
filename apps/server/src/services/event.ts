@@ -229,6 +229,7 @@ export interface AppendProjectEventInput<T = Record<string, unknown>> {
   entityType: string;
   entityId: string;
   payload: T;
+  updatedAt?: Date | undefined;
 }
 
 /**
@@ -325,7 +326,7 @@ export class EventService {
       .update(projects)
       .set({
         lastSeq: nextSeq,
-        updatedAt: new Date(),
+        updatedAt: input.updatedAt ?? new Date(),
       })
       .where(eq(projects.id, validated.projectId));
 
