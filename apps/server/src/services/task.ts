@@ -1282,11 +1282,25 @@ export class TaskService {
         newRankKey = generateRankKey(lastActiveTask ? lastActiveTask.rankKey : null, null);
 
         if (newRankKey.length > REBALANCE_THRESHOLD_LENGTH) {
-          await this.rebalanceColumnActiveTasks(tx, {
+          const rebalancedMap = await this.rebalanceColumnActiveTasks(tx, {
             projectId: project.id,
             columnId: task.columnId,
             excludeTaskId: taskId,
           });
+
+          if (rebalancedMap.size > 0) {
+            await EventService.appendProjectEvent(tx, {
+              projectId: project.id,
+              actorId: callerId,
+              eventType: "column.rebalanced",
+              entityType: "column",
+              entityId: task.columnId,
+              payload: {
+                columnId: task.columnId,
+                rankKeyMap: Object.fromEntries(rebalancedMap),
+              },
+            });
+          }
 
           const [freshLastActive] = await tx
             .select({ rankKey: tasks.rankKey })
@@ -1325,6 +1339,22 @@ export class TaskService {
       if (!restoredTask) {
         throw new Error("Failed to restore task");
       }
+
+      // 8. Append task.restored domain event in the same transaction
+      const snapshot = buildTaskSnapshot(restoredTask);
+      const changes = buildTaskChanges(task, restoredTask);
+
+      await EventService.appendProjectEvent(tx, {
+        projectId: project.id,
+        actorId: callerId,
+        eventType: "task.restored",
+        entityType: "task",
+        entityId: restoredTask.id,
+        payload: {
+          task: snapshot,
+          changes,
+        },
+      });
 
       return restoredTask;
     });

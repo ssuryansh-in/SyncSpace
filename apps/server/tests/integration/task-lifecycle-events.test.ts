@@ -18,6 +18,7 @@ import {
   taskCreatedPayloadSchema,
   taskUpdatedPayloadSchema,
   taskArchivedPayloadSchema,
+  taskRestoredPayloadSchema,
   columnRebalancedPayloadSchema,
 } from "../../src/services/event.js";
 
@@ -1343,6 +1344,501 @@ describe("Task Lifecycle & Column Rebalancing Events (Integration - Milestone 7.
         expect(receivedNotifications[0]).toEqual({
           projectId: project.id,
           seq: 2,
+        });
+      } finally {
+        if (waiter) clearTimeout((waiter as any).timer);
+        await subscription.unlisten();
+      }
+    });
+  });
+
+  describe("F. Task Restoration (task.restored)", () => {
+    it("emits exactly one task.restored event with canonical 13-field snapshot and archivedAt diff on standard restoration", async () => {
+      const { owner, project, columns } = await setupWorkspaceAndProject();
+      const colId = columns[0].id;
+
+      // Create a task
+      const createRes = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Cookie: owner.cookie,
+          "Idempotency-Key": `task-res-std-${crypto.randomUUID()}`,
+        },
+        body: JSON.stringify({
+          title: "Standard Restore Task",
+          columnId: colId,
+        }),
+      });
+      const { task } = await createRes.json();
+
+      // Archive the task
+      const archiveRes = await app.request(`/api/tasks/${task.id}/archive`, {
+        method: "POST",
+        headers: { Cookie: owner.cookie },
+      });
+      expect(archiveRes.status).toBe(200);
+      const { task: archivedTask } = await archiveRes.json();
+      expect(archivedTask.archivedAt).not.toBeNull();
+      expect(archivedTask.version).toBe(2);
+
+      // Restore the task
+      const restoreRes = await app.request(`/api/tasks/${task.id}/restore`, {
+        method: "POST",
+        headers: { Cookie: owner.cookie },
+      });
+
+      expect(restoreRes.status).toBe(200);
+      const { task: restoredTask } = await restoreRes.json();
+      expect(restoredTask.archivedAt).toBeNull();
+      expect(restoredTask.version).toBe(3);
+
+      const events = await testDb
+        .select()
+        .from(projectEvents)
+        .where(eq(projectEvents.projectId, project.id))
+        .orderBy(asc(projectEvents.seq));
+
+      // Exactly 3 events: task.created (seq 1), task.archived (seq 2), task.restored (seq 3)
+      expect(events).toHaveLength(3);
+      const restoreEvent = events[2]!;
+
+      expect(restoreEvent.seq).toBe(3);
+      expect(restoreEvent.eventType).toBe("task.restored");
+      expect(restoreEvent.entityType).toBe("task");
+      expect(restoreEvent.entityId).toBe(task.id);
+      expect(restoreEvent.actorId).toBe(owner.user.id);
+      expect(() => taskRestoredPayloadSchema.parse(restoreEvent.payload)).not.toThrow();
+
+      const payload = restoreEvent.payload as any;
+
+      // 1. Snapshot has all 13 canonical fields with archivedAt = null and version = 3
+      expect(payload.task).toEqual({
+        id: task.id,
+        projectId: project.id,
+        columnId: colId,
+        title: "Standard Restore Task",
+        description: "",
+        createdBy: owner.user.id,
+        assigneeId: null,
+        rankKey: task.rankKey,
+        version: 3,
+        dueDate: null,
+        createdAt: task.createdAt,
+        updatedAt: restoredTask.updatedAt,
+        archivedAt: null,
+      });
+
+      // 2. Changes object reflects transition of archivedAt from original ISO to null
+      expect(payload.changes).toEqual({
+        archivedAt: { from: archivedTask.archivedAt, to: null },
+      });
+
+      // 3. rankKey was unchanged, so it is strictly absent from changes
+      expect(payload.changes.rankKey).toBeUndefined();
+
+      // 4. Description was unchanged, so it is strictly absent from changes
+      expect(payload.changes.description).toBeUndefined();
+
+      // 5. Project sequence is 3
+      const [dbProject] = await testDb
+        .select()
+        .from(projects)
+        .where(eq(projects.id, project.id));
+      expect(dbProject!.lastSeq).toBe(3);
+    });
+
+    it("emits task.restored with rankKey diff on collision repair without rebalancing", async () => {
+      const { owner, project, columns } = await setupWorkspaceAndProject();
+      const colId = columns[0].id;
+
+      // Seed active task t1 with rankKey "a0"
+      const [t1] = await testDb
+        .insert(tasks)
+        .values({
+          projectId: project.id,
+          columnId: colId,
+          title: "Active Task 1",
+          createdBy: owner.user.id,
+          rankKey: "a0",
+          version: 1,
+        })
+        .returning();
+
+      // Seed archived task t2 with identical rankKey "a0" (simulating collision on restore)
+      const originalArchivedAt = new Date("2026-11-01T12:00:00.000Z");
+      const [t2] = await testDb
+        .insert(tasks)
+        .values({
+          projectId: project.id,
+          columnId: colId,
+          title: "Archived Colliding Task",
+          createdBy: owner.user.id,
+          rankKey: "a0",
+          version: 1,
+          archivedAt: originalArchivedAt,
+        })
+        .returning();
+
+      // Restore t2
+      const restoreRes = await app.request(`/api/tasks/${t2.id}/restore`, {
+        method: "POST",
+        headers: { Cookie: owner.cookie },
+      });
+
+      expect(restoreRes.status).toBe(200);
+      const { task: restoredTask } = await restoreRes.json();
+
+      // t2 collides on "a0", so it is repaired by appending after t1: "a0" -> "a1"
+      expect(restoredTask.rankKey).toBe("a1");
+      expect(restoredTask.archivedAt).toBeNull();
+      expect(restoredTask.version).toBe(2);
+
+      const events = await testDb
+        .select()
+        .from(projectEvents)
+        .where(eq(projectEvents.projectId, project.id));
+
+      // Exactly 1 event emitted: task.restored (zero column.rebalanced events because candidate key "a1" length <= 32)
+      expect(events).toHaveLength(1);
+      const restoreEvent = events[0]!;
+
+      expect(restoreEvent.eventType).toBe("task.restored");
+      expect(restoreEvent.seq).toBe(1);
+      expect(() => taskRestoredPayloadSchema.parse(restoreEvent.payload)).not.toThrow();
+
+      const payload = restoreEvent.payload as any;
+
+      // Changes diff must include both archivedAt and rankKey
+      expect(payload.changes).toEqual({
+        archivedAt: { from: originalArchivedAt.toISOString(), to: null },
+        rankKey: { from: "a0", to: "a1" },
+      });
+
+      expect(payload.task.rankKey).toBe("a1");
+      expect(payload.task.archivedAt).toBeNull();
+    });
+
+    it("emits column.rebalanced before task.restored with consecutive sequence numbers when collision repair triggers rebalancing", async () => {
+      const { owner, project, columns } = await setupWorkspaceAndProject();
+      const colId = columns[0].id;
+
+      // Seed:
+      // - tActive1: active task with rankKey "a0"
+      // - tActive2: active task with 32-character rankKey "z".repeat(32). Appending after it creates length 33 (> 32)
+      // - tArchOther: another archived task with rankKey "m999" (must be excluded from rebalance)
+      // - tRestoring: colliding archived task with rankKey "a0"
+      const [tActive1] = await testDb
+        .insert(tasks)
+        .values({
+          projectId: project.id,
+          columnId: colId,
+          title: "Active Task 1",
+          createdBy: owner.user.id,
+          rankKey: "a0",
+          version: 1,
+        })
+        .returning();
+
+      const longKey = "z".repeat(32);
+      expect(longKey.length).toBe(32);
+
+      const [tActive2] = await testDb
+        .insert(tasks)
+        .values({
+          projectId: project.id,
+          columnId: colId,
+          title: "Active Task 2 Long Key",
+          createdBy: owner.user.id,
+          rankKey: longKey,
+          version: 2,
+        })
+        .returning();
+
+      const [tArchOther] = await testDb
+        .insert(tasks)
+        .values({
+          projectId: project.id,
+          columnId: colId,
+          title: "Other Archived Task",
+          createdBy: owner.user.id,
+          rankKey: "m999",
+          version: 1,
+          archivedAt: new Date("2026-11-02T10:00:00.000Z"),
+        })
+        .returning();
+
+      const originalArchivedAt = new Date("2026-11-03T10:00:00.000Z");
+      const [tRestoring] = await testDb
+        .insert(tasks)
+        .values({
+          projectId: project.id,
+          columnId: colId,
+          title: "Restoring Colliding Task",
+          createdBy: owner.user.id,
+          rankKey: "a0",
+          version: 1,
+          archivedAt: originalArchivedAt,
+        })
+        .returning();
+
+      // Restore tRestoring
+      const restoreRes = await app.request(`/api/tasks/${tRestoring.id}/restore`, {
+        method: "POST",
+        headers: { Cookie: owner.cookie },
+      });
+
+      expect(restoreRes.status).toBe(200);
+      const { task: restoredTask } = await restoreRes.json();
+
+      // Query all project events in order
+      const events = await testDb
+        .select()
+        .from(projectEvents)
+        .where(eq(projectEvents.projectId, project.id))
+        .orderBy(asc(projectEvents.seq));
+
+      // Must have exactly 2 events: column.rebalanced (seq 1), then task.restored (seq 2)
+      expect(events).toHaveLength(2);
+
+      const [rebalEvent, restoreEvent] = events;
+
+      // Event 1: column.rebalanced
+      expect(rebalEvent!.seq).toBe(1);
+      expect(rebalEvent!.eventType).toBe("column.rebalanced");
+      expect(rebalEvent!.entityType).toBe("column");
+      expect(rebalEvent!.entityId).toBe(colId);
+      expect(() => columnRebalancedPayloadSchema.parse(rebalEvent!.payload)).not.toThrow();
+
+      const rebalPayload = rebalEvent!.payload as any;
+      expect(rebalPayload.columnId).toBe(colId);
+
+      // Verify rankKeyMap contains all active tasks rebalanced in the column
+      expect(rebalPayload.rankKeyMap[tActive1.id]).toBe("a0");
+      expect(rebalPayload.rankKeyMap[tActive2.id]).toBe("a1");
+
+      // Verify other archived task is strictly EXCLUDED from rankKeyMap
+      expect(rebalPayload.rankKeyMap[tArchOther.id]).toBeUndefined();
+
+      // Verify the restoring task was NOT in rankKeyMap during active-task rebalance
+      expect(rebalPayload.rankKeyMap[tRestoring.id]).toBeUndefined();
+
+      // Event 2: task.restored
+      expect(restoreEvent!.seq).toBe(2);
+      expect(restoreEvent!.eventType).toBe("task.restored");
+      expect(restoreEvent!.entityType).toBe("task");
+      expect(restoreEvent!.entityId).toBe(tRestoring.id);
+      expect(() => taskRestoredPayloadSchema.parse(restoreEvent!.payload)).not.toThrow();
+
+      const restorePayload = restoreEvent!.payload as any;
+
+      // Snapshot carries the final clean rank key ("a2") appended after the rebalanced column tasks
+      expect(restorePayload.task.rankKey).toBe("a2");
+      expect(restorePayload.task.archivedAt).toBeNull();
+      expect(restorePayload.task.version).toBe(2);
+
+      // Changes diff carries both archivedAt transition and rankKey transition
+      expect(restorePayload.changes).toEqual({
+        archivedAt: { from: originalArchivedAt.toISOString(), to: null },
+        rankKey: { from: "a0", to: "a2" },
+      });
+
+      // Project sequence must be updated to 2
+      const [dbProject] = await testDb
+        .select()
+        .from(projects)
+        .where(eq(projects.id, project.id));
+      expect(dbProject!.lastSeq).toBe(2);
+    });
+
+    it("suppresses event emission and preserves version on repeated restore calls (idempotent no-op)", async () => {
+      const { owner, project, columns } = await setupWorkspaceAndProject();
+      const colId = columns[0].id;
+
+      // Seed an already active task
+      const [activeTask] = await testDb
+        .insert(tasks)
+        .values({
+          projectId: project.id,
+          columnId: colId,
+          title: "Already Active Task",
+          createdBy: owner.user.id,
+          rankKey: "a0",
+          version: 1,
+          archivedAt: null,
+        })
+        .returning();
+
+      // Call /restore on the active task
+      const restoreRes = await app.request(`/api/tasks/${activeTask.id}/restore`, {
+        method: "POST",
+        headers: { Cookie: owner.cookie },
+      });
+
+      expect(restoreRes.status).toBe(200);
+      const { task: returnedTask } = await restoreRes.json();
+
+      // Version, timestamps, and rankKey are strictly preserved
+      expect(returnedTask.version).toBe(1);
+      expect(returnedTask.rankKey).toBe("a0");
+      expect(returnedTask.archivedAt).toBeNull();
+
+      // Zero events emitted
+      const events = await testDb
+        .select()
+        .from(projectEvents)
+        .where(eq(projectEvents.projectId, project.id));
+      expect(events).toHaveLength(0);
+
+      // Project sequence remains 0
+      const [dbProject] = await testDb
+        .select()
+        .from(projects)
+        .where(eq(projects.id, project.id));
+      expect(dbProject!.lastSeq).toBe(0);
+    });
+
+    it("rolls back task restoration, event row, and sequence counter when transaction aborts before commit", async () => {
+      const { owner, project, columns } = await setupWorkspaceAndProject();
+      const colId = columns[0].id;
+
+      // Seed archived task
+      const originalArchivedAt = new Date("2026-11-05T10:00:00.000Z");
+      const [task] = await testDb
+        .insert(tasks)
+        .values({
+          projectId: project.id,
+          columnId: colId,
+          title: "Task Before Restore Rollback",
+          createdBy: owner.user.id,
+          rankKey: "a0",
+          version: 1,
+          archivedAt: originalArchivedAt,
+        })
+        .returning();
+
+      // Listener with synchronization barrier
+      const listenerClient = testSqlClient;
+      const receivedNotifications: Array<{ projectId: string; seq: number }> = [];
+
+      type NotificationEvent = { channel: string; payload: { projectId: string; seq: number } };
+      let waiter: {
+        expectedSeq: number;
+        resolve: (event: NotificationEvent) => void;
+        reject: (err: Error) => void;
+        timer: NodeJS.Timeout;
+      } | null = null;
+
+      function waitForNotification(expectedSeq: number, timeoutMs = 5000): Promise<NotificationEvent> {
+        return new Promise<NotificationEvent>((resolve, reject) => {
+          const existing = receivedNotifications.find((n) => n.seq === expectedSeq);
+          if (existing) {
+            return resolve({ channel: "project_events", payload: existing });
+          }
+
+          const timer = setTimeout(() => {
+            reject(new Error(`Timed out waiting for notification seq=${expectedSeq}`));
+          }, timeoutMs);
+
+          waiter = { expectedSeq, resolve, reject, timer };
+        });
+      }
+
+      const subscription = await listenerClient.listen("project_events", (payloadStr) => {
+        try {
+          const parsed = JSON.parse(payloadStr) as { projectId: string; seq: number };
+          receivedNotifications.push(parsed);
+
+          if (waiter && waiter.expectedSeq === parsed.seq) {
+            clearTimeout(waiter.timer);
+            waiter.resolve({ channel: "project_events", payload: parsed });
+            waiter = null;
+          }
+        } catch (err: any) {
+          if (waiter) {
+            clearTimeout(waiter.timer);
+            waiter.reject(err);
+            waiter = null;
+          }
+        }
+      });
+
+      try {
+        // Aborted restore transaction
+        let aborted = false;
+        try {
+          await testDb.transaction(async (tx) => {
+            await (tx.select().from(projects).where(eq(projects.id, project.id)) as any).for("update");
+            const [lockedTask] = await (tx.select().from(tasks).where(eq(tasks.id, task.id)) as any).for("update");
+
+            const [restoredTask] = await tx
+              .update(tasks)
+              .set({
+                archivedAt: null,
+                version: lockedTask!.version + 1,
+                updatedAt: new Date(),
+              })
+              .where(eq(tasks.id, task.id))
+              .returning();
+
+            const { EventService } = await import("../../src/services/event.js");
+            const { buildTaskSnapshot, buildTaskChanges } = await import("../../src/services/task.js");
+
+            await EventService.appendProjectEvent(tx, {
+              projectId: project.id,
+              actorId: owner.user.id,
+              eventType: "task.restored",
+              entityType: "task",
+              entityId: restoredTask!.id,
+              payload: {
+                task: buildTaskSnapshot(restoredTask!),
+                changes: buildTaskChanges(lockedTask!, restoredTask!),
+              },
+            });
+
+            throw new Error("Deliberate abort after restore event append");
+          });
+        } catch (err: any) {
+          if (err.message === "Deliberate abort after restore event append") {
+            aborted = true;
+          }
+        }
+
+        expect(aborted).toBe(true);
+
+        // Verify task row rolled back: archivedAt is still set, version is still 1
+        const [dbTask] = await testDb.select().from(tasks).where(eq(tasks.id, task.id));
+        expect(dbTask!.archivedAt).not.toBeNull();
+        expect(dbTask!.archivedAt!.toISOString()).toBe(originalArchivedAt.toISOString());
+        expect(dbTask!.version).toBe(1);
+
+        // Verify sequence remains 0
+        const [dbProject] = await testDb.select().from(projects).where(eq(projects.id, project.id));
+        expect(dbProject!.lastSeq).toBe(0);
+
+        // Verify project_events has 0 rows
+        const events = await testDb.select().from(projectEvents).where(eq(projectEvents.projectId, project.id));
+        expect(events).toHaveLength(0);
+
+        // Synchronization barrier: perform successful task restoration via API (allocating seq 1)
+        const barrierPromise = waitForNotification(1);
+        const barrierRes = await app.request(`/api/tasks/${task.id}/restore`, {
+          method: "POST",
+          headers: { Cookie: owner.cookie },
+        });
+        expect(barrierRes.status).toBe(200);
+
+        const barrierNotification = await barrierPromise;
+        expect(barrierNotification.payload).toEqual({
+          projectId: project.id,
+          seq: 1,
+        });
+
+        // Exactly one notification was received by listener during this test block (for seq 1)
+        expect(receivedNotifications).toHaveLength(1);
+        expect(receivedNotifications[0]).toEqual({
+          projectId: project.id,
+          seq: 1,
         });
       } finally {
         if (waiter) clearTimeout((waiter as any).timer);
