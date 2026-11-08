@@ -1029,6 +1029,20 @@ export class TaskService {
           excludeTaskId: taskId,
         });
 
+        if (rebalancedMap.size > 0) {
+          await EventService.appendProjectEvent(tx, {
+            projectId: project.id,
+            actorId: callerId,
+            eventType: "column.rebalanced",
+            entityType: "column",
+            entityId: columnId,
+            payload: {
+              columnId,
+              rankKeyMap: Object.fromEntries(rebalancedMap),
+            },
+          });
+        }
+
         const freshPrevRank = targetPrev
           ? (rebalancedMap.get(targetPrev.id) ?? targetPrev.rankKey)
           : null;
@@ -1061,6 +1075,22 @@ export class TaskService {
           currentVersion: task.version,
         });
       }
+
+      // 14. Append task.moved domain event in the same transaction
+      const snapshot = buildTaskSnapshot(updatedTask);
+      const changes = buildTaskChanges(task, updatedTask);
+
+      await EventService.appendProjectEvent(tx, {
+        projectId: project.id,
+        actorId: callerId,
+        eventType: "task.moved",
+        entityType: "task",
+        entityId: updatedTask.id,
+        payload: {
+          task: snapshot,
+          changes,
+        },
+      });
 
       return updatedTask;
     });
