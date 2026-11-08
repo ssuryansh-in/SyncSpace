@@ -1,7 +1,8 @@
 import { and, asc, eq, isNull } from "drizzle-orm";
 import type { Database } from "../db/index.js";
-import { comments, projects, tasks, users, workspaceMembers } from "../db/schema/index.js";
+import { comments, projects, tasks, users, workspaceMembers, type Comment } from "../db/schema/index.js";
 import { AppError } from "../errors/index.js";
+import { EventService } from "./event.js";
 import { computeRequestHash, IdempotencyService } from "./idempotency.js";
 
 export interface CommentWithAuthor {
@@ -15,6 +16,59 @@ export interface CommentWithAuthor {
   body: string;
   createdAt: Date;
   deletedAt: Date | null;
+}
+
+export type CommentCreatedPayload = {
+  commentId: string;
+  taskId: string;
+  authorId: string;
+  createdAt: string;
+};
+
+export type CommentDeletedPayload = {
+  commentId: string;
+  taskId: string;
+  authorId: string;
+  deletedAt: string;
+};
+
+/**
+ * Builds the payload for comment.created events.
+ * Conforms strictly to docs/SPECIFICATION.md Section 8.3, 8.6 and commentCreatedPayloadSchema.
+ * Privacy invariant: strictly excludes comment body text.
+ * Pure, deterministic, side-effect free.
+ */
+export function buildCommentCreatedPayload(comment: Comment): CommentCreatedPayload {
+  return {
+    commentId: comment.id,
+    taskId: comment.taskId,
+    authorId: comment.authorId,
+    createdAt:
+      comment.createdAt instanceof Date
+        ? comment.createdAt.toISOString()
+        : new Date(comment.createdAt).toISOString(),
+  };
+}
+
+/**
+ * Builds the payload for comment.deleted events.
+ * Conforms strictly to docs/SPECIFICATION.md Section 8.3, 8.6 and commentDeletedPayloadSchema.
+ * Privacy invariant: strictly excludes comment body text.
+ * Pure, deterministic, side-effect free.
+ */
+export function buildCommentDeletedPayload(
+  comment: Comment,
+  deletedAt: Date | string
+): CommentDeletedPayload {
+  return {
+    commentId: comment.id,
+    taskId: comment.taskId,
+    authorId: comment.authorId,
+    deletedAt:
+      deletedAt instanceof Date
+        ? deletedAt.toISOString()
+        : new Date(deletedAt).toISOString(),
+  };
 }
 
 export interface CreateCommentParams {
@@ -43,7 +97,9 @@ export class CommentService {
   /**
    * Helper to resolve task, parent project, and verify caller workspace membership.
    * Conceals non-existent tasks or non-member access with 404 NOT_FOUND.
-   * Supports row-level locking via FOR UPDATE when inside a transaction.
+   * For read-only calls (forUpdate = false), executes snapshot queries without holding row locks.
+   * Note: listing comments is permitted on both active and archived tasks/projects (read-only audit).
+   * When forUpdate is true, acquires locks in strict top-down order: projects -> tasks.
    */
   private static async getTaskWithContext(
     dbOrTx: Database,
@@ -51,30 +107,82 @@ export class CommentService {
     callerId: string,
     forUpdate = false
   ) {
-    let taskQuery = dbOrTx
-      .select()
+    if (!forUpdate) {
+      const [task] = await dbOrTx
+        .select()
+        .from(tasks)
+        .where(eq(tasks.id, taskId));
+
+      if (!task) {
+        throw AppError.notFound("Task not found");
+      }
+
+      const [project] = await dbOrTx
+        .select()
+        .from(projects)
+        .where(eq(projects.id, task.projectId));
+
+      if (!project) {
+        throw AppError.notFound("Task not found");
+      }
+
+      const [membership] = await dbOrTx
+        .select()
+        .from(workspaceMembers)
+        .where(
+          and(
+            eq(workspaceMembers.workspaceId, project.workspaceId),
+            eq(workspaceMembers.userId, callerId)
+          )
+        );
+
+      if (!membership) {
+        throw AppError.notFound("Task not found");
+      }
+
+      return { task, project, membership };
+    }
+
+    // Mutating path (forUpdate === true):
+    // 1. Initial snapshot metadata lookup to resolve parent projectId (read-only, no locks held)
+    const [meta] = await dbOrTx
+      .select({
+        taskId: tasks.id,
+        projectId: tasks.projectId,
+      })
       .from(tasks)
       .where(eq(tasks.id, taskId));
 
-    if (forUpdate) {
-      taskQuery = (taskQuery as any).for("update");
-    }
-
-    const [task] = await taskQuery;
-
-    if (!task) {
+    if (!meta) {
       throw AppError.notFound("Task not found");
     }
 
-    const [project] = await dbOrTx
+    // 2. Lock 1: projects row (Top-Level)
+    const [project] = await (dbOrTx
       .select()
       .from(projects)
-      .where(eq(projects.id, task.projectId));
+      .where(eq(projects.id, meta.projectId)) as any).for("update");
 
     if (!project) {
       throw AppError.notFound("Task not found");
     }
 
+    // 3. Lock 2: tasks row (Mid-Level)
+    const [task] = await (dbOrTx
+      .select()
+      .from(tasks)
+      .where(eq(tasks.id, taskId)) as any).for("update");
+
+    if (!task) {
+      throw AppError.notFound("Task not found");
+    }
+
+    // 4. Re-validate that the locked task maintains consistent relationship with locked project
+    if (task.projectId !== project.id) {
+      throw AppError.notFound("Task not found");
+    }
+
+    // 5. Verify caller membership in the parent workspace (conceal existence if not member)
     const [membership] = await dbOrTx
       .select()
       .from(workspaceMembers)
@@ -277,7 +385,19 @@ export class CommentService {
           throw new Error("Failed to create comment");
         }
 
-        // 6. Fetch author metadata
+        // 6. Append comment.created domain event
+        const eventPayload = buildCommentCreatedPayload(newComment);
+
+        await EventService.appendProjectEvent(tx, {
+          projectId: project.id,
+          actorId: callerId,
+          eventType: "comment.created",
+          entityType: "comment",
+          entityId: newComment.id,
+          payload: eventPayload,
+        });
+
+        // 7. Fetch author metadata
         const [authorUser] = await tx
           .select({ id: users.id, displayName: users.displayName })
           .from(users)
@@ -418,11 +538,25 @@ export class CommentService {
         return { status: true, message: "Comment deleted" };
       }
 
+      const now = new Date();
+
       // 6. Soft delete by setting deleted_at = now()
       await tx
         .update(comments)
-        .set({ deletedAt: new Date() })
+        .set({ deletedAt: now })
         .where(and(eq(comments.id, commentId), isNull(comments.deletedAt)));
+
+      // 7. Emit comment.deleted domain event
+      const eventPayload = buildCommentDeletedPayload(comment, now);
+
+      await EventService.appendProjectEvent(tx, {
+        projectId: project.id,
+        actorId: callerId,
+        eventType: "comment.deleted",
+        entityType: "comment",
+        entityId: comment.id,
+        payload: eventPayload,
+      });
 
       return { status: true, message: "Comment deleted" };
     });
