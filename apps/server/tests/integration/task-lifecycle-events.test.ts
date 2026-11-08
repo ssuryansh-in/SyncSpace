@@ -16,10 +16,12 @@ import {
 import { cleanTables, testDb, testSqlClient } from "./setup.js";
 import {
   taskCreatedPayloadSchema,
+  taskUpdatedPayloadSchema,
+  taskArchivedPayloadSchema,
   columnRebalancedPayloadSchema,
 } from "../../src/services/event.js";
 
-describe("Task Lifecycle & Column Rebalancing Events (Integration - Milestone 7.2B-1)", () => {
+describe("Task Lifecycle & Column Rebalancing Events (Integration - Milestone 7.2B)", () => {
   const testEnv = loadEnv({
     NODE_ENV: "test",
     PORT: "4000",
@@ -654,6 +656,693 @@ describe("Task Lifecycle & Column Rebalancing Events (Integration - Milestone 7.
         expect(receivedNotifications[0]).toEqual({
           projectId: project.id,
           seq: 1,
+        });
+      } finally {
+        if (waiter) clearTimeout((waiter as any).timer);
+        await subscription.unlisten();
+      }
+    });
+  });
+
+  describe("D. Task Updates (task.updated)", () => {
+    it("emits exactly one task.updated event with canonical 13-field snapshot and {from, to} field changes", async () => {
+      const { owner, workspace, project, columns } = await setupWorkspaceAndProject();
+      const colId = columns[0].id;
+
+      // Add a member
+      const member = await createAndLoginUser("Member User", "member-update@example.com");
+      await testDb.insert(workspaceMembers).values({
+        workspaceId: workspace.id,
+        userId: member.user.id,
+        role: "member",
+      });
+
+      // Create a task
+      const createRes = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Cookie: owner.cookie,
+          "Idempotency-Key": `task-upd-init-${crypto.randomUUID()}`,
+        },
+        body: JSON.stringify({
+          title: "Initial Title",
+          columnId: colId,
+        }),
+      });
+      const { task } = await createRes.json();
+
+      // Update the task: change title, assignee, and due date
+      const patchRes = await app.request(`/api/tasks/${task.id}`, {
+        method: "PATCH",
+        headers: {
+          "Content-Type": "application/json",
+          Cookie: owner.cookie,
+        },
+        body: JSON.stringify({
+          title: "Updated Title",
+          assigneeId: member.user.id,
+          dueDate: "2026-12-15",
+          expectedVersion: 1,
+        }),
+      });
+
+      expect(patchRes.status).toBe(200);
+      const { task: updatedTask } = await patchRes.json();
+      expect(updatedTask.version).toBe(2);
+
+      // Verify events in project_events
+      const events = await testDb
+        .select()
+        .from(projectEvents)
+        .where(eq(projectEvents.projectId, project.id))
+        .orderBy(asc(projectEvents.seq));
+
+      // Exactly 2 events: task.created (seq 1) and task.updated (seq 2)
+      expect(events).toHaveLength(2);
+      const updateEvent = events[1]!;
+
+      expect(updateEvent.seq).toBe(2);
+      expect(updateEvent.eventType).toBe("task.updated");
+      expect(updateEvent.entityType).toBe("task");
+      expect(updateEvent.entityId).toBe(task.id);
+      expect(updateEvent.actorId).toBe(owner.user.id);
+      expect(() => taskUpdatedPayloadSchema.parse(updateEvent.payload)).not.toThrow();
+
+      const payload = updateEvent.payload as any;
+
+      // 1. Snapshot has all 13 canonical fields reflecting version 2
+      expect(payload.task).toEqual({
+        id: task.id,
+        projectId: project.id,
+        columnId: colId,
+        title: "Updated Title",
+        description: "",
+        createdBy: owner.user.id,
+        assigneeId: member.user.id,
+        rankKey: task.rankKey,
+        version: 2,
+        dueDate: "2026-12-15",
+        createdAt: task.createdAt,
+        updatedAt: updatedTask.updatedAt,
+        archivedAt: null,
+      });
+
+      // 2. Changes object has exact { from, to } diffs
+      expect(payload.changes).toEqual({
+        title: { from: "Initial Title", to: "Updated Title" },
+        assigneeId: { from: null, to: member.user.id },
+        dueDate: { from: null, to: "2026-12-15" },
+      });
+
+      // 3. Project sequence is 2
+      const [dbProject] = await testDb
+        .select()
+        .from(projects)
+        .where(eq(projects.id, project.id));
+      expect(dbProject!.lastSeq).toBe(2);
+    });
+
+    it("strictly preserves description privacy in task.updated: diff is { description: { changed: true } } without leaking old or new description", async () => {
+      const { owner, project, columns } = await setupWorkspaceAndProject();
+      const colId = columns[0].id;
+      const initialSecret = "Initial Private Blueprint";
+      const updatedSecret = "Classified Updated Strategy";
+
+      const createRes = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Cookie: owner.cookie,
+          "Idempotency-Key": `task-upd-desc-${crypto.randomUUID()}`,
+        },
+        body: JSON.stringify({
+          title: "Sensitive Task",
+          columnId: colId,
+          description: initialSecret,
+        }),
+      });
+      const { task } = await createRes.json();
+
+      const patchRes = await app.request(`/api/tasks/${task.id}`, {
+        method: "PATCH",
+        headers: {
+          "Content-Type": "application/json",
+          Cookie: owner.cookie,
+        },
+        body: JSON.stringify({
+          description: updatedSecret,
+          expectedVersion: 1,
+        }),
+      });
+
+      expect(patchRes.status).toBe(200);
+
+      const events = await testDb
+        .select()
+        .from(projectEvents)
+        .where(eq(projectEvents.projectId, project.id))
+        .orderBy(asc(projectEvents.seq));
+
+      expect(events).toHaveLength(2);
+      const updateEvent = events[1]!;
+      const payload = updateEvent.payload as any;
+
+      // The snapshot carries the updated description for board state hydration
+      expect(payload.task.description).toBe(updatedSecret);
+
+      // The changes diff MUST strictly be { description: { changed: true } }
+      expect(payload.changes.description).toEqual({ changed: true });
+
+      // Invariant: neither initial nor updated description text appears in serialized changes
+      const serializedChanges = JSON.stringify(payload.changes);
+      expect(serializedChanges).not.toContain(initialSecret);
+      expect(serializedChanges).not.toContain(updatedSecret);
+      expect(serializedChanges).not.toContain('"from"');
+      expect(serializedChanges).not.toContain('"to"');
+    });
+
+    it("suppresses event emission and preserves version on no-op task updates", async () => {
+      const { owner, project, columns } = await setupWorkspaceAndProject();
+      const colId = columns[0].id;
+
+      const createRes = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Cookie: owner.cookie,
+          "Idempotency-Key": `task-upd-noop-${crypto.randomUUID()}`,
+        },
+        body: JSON.stringify({
+          title: "Static Task",
+          columnId: colId,
+          description: "Static description",
+        }),
+      });
+      const { task } = await createRes.json();
+
+      // Submit identical values in PATCH
+      const patchRes = await app.request(`/api/tasks/${task.id}`, {
+        method: "PATCH",
+        headers: {
+          "Content-Type": "application/json",
+          Cookie: owner.cookie,
+        },
+        body: JSON.stringify({
+          title: "Static Task",
+          description: "Static description",
+          expectedVersion: 1,
+        }),
+      });
+
+      expect(patchRes.status).toBe(200);
+      const { task: returnedTask } = await patchRes.json();
+
+      // Version must NOT be incremented
+      expect(returnedTask.version).toBe(1);
+
+      // Project events count must remain strictly 1 (task.created only)
+      const events = await testDb
+        .select()
+        .from(projectEvents)
+        .where(eq(projectEvents.projectId, project.id));
+      expect(events).toHaveLength(1);
+      expect(events[0]!.eventType).toBe("task.created");
+
+      // Project sequence must remain 1
+      const [dbProject] = await testDb
+        .select()
+        .from(projects)
+        .where(eq(projects.id, project.id));
+      expect(dbProject!.lastSeq).toBe(1);
+    });
+
+    it("enforces optimistic concurrency: rejects stale expectedVersion with 409 and emits zero events", async () => {
+      const { owner, project, columns } = await setupWorkspaceAndProject();
+      const colId = columns[0].id;
+
+      const createRes = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Cookie: owner.cookie,
+          "Idempotency-Key": `task-upd-conflict-${crypto.randomUUID()}`,
+        },
+        body: JSON.stringify({
+          title: "Versioned Task",
+          columnId: colId,
+        }),
+      });
+      const { task } = await createRes.json();
+
+      // Submit with stale expectedVersion (expectedVersion: 99 instead of 1)
+      const conflictRes = await app.request(`/api/tasks/${task.id}`, {
+        method: "PATCH",
+        headers: {
+          "Content-Type": "application/json",
+          Cookie: owner.cookie,
+        },
+        body: JSON.stringify({
+          title: "Stale Edit",
+          expectedVersion: 99,
+        }),
+      });
+
+      expect(conflictRes.status).toBe(409);
+      const conflictBody = await conflictRes.json();
+      expect(conflictBody.error.code).toBe("VERSION_CONFLICT");
+
+      // No task.updated event was emitted
+      const events = await testDb
+        .select()
+        .from(projectEvents)
+        .where(eq(projectEvents.projectId, project.id));
+      expect(events).toHaveLength(1);
+      expect(events[0]!.eventType).toBe("task.created");
+    });
+
+    it("rolls back task update, event row, and sequence counter when transaction aborts before commit", async () => {
+      const { owner, project, columns } = await setupWorkspaceAndProject();
+      const colId = columns[0].id;
+
+      const createRes = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Cookie: owner.cookie,
+          "Idempotency-Key": `task-upd-rb-init-${crypto.randomUUID()}`,
+        },
+        body: JSON.stringify({
+          title: "Task Before Update Rollback",
+          columnId: colId,
+        }),
+      });
+      const { task } = await createRes.json();
+
+      // Listener with synchronization barrier
+      const listenerClient = testSqlClient;
+      const receivedNotifications: Array<{ projectId: string; seq: number }> = [];
+
+      type NotificationEvent = { channel: string; payload: { projectId: string; seq: number } };
+      let waiter: {
+        expectedSeq: number;
+        resolve: (event: NotificationEvent) => void;
+        reject: (err: Error) => void;
+        timer: NodeJS.Timeout;
+      } | null = null;
+
+      function waitForNotification(expectedSeq: number, timeoutMs = 5000): Promise<NotificationEvent> {
+        return new Promise<NotificationEvent>((resolve, reject) => {
+          const existing = receivedNotifications.find((n) => n.seq === expectedSeq);
+          if (existing) {
+            return resolve({ channel: "project_events", payload: existing });
+          }
+
+          const timer = setTimeout(() => {
+            reject(new Error(`Timed out waiting for notification seq=${expectedSeq}`));
+          }, timeoutMs);
+
+          waiter = { expectedSeq, resolve, reject, timer };
+        });
+      }
+
+      const subscription = await listenerClient.listen("project_events", (payloadStr) => {
+        try {
+          const parsed = JSON.parse(payloadStr) as { projectId: string; seq: number };
+          receivedNotifications.push(parsed);
+
+          if (waiter && waiter.expectedSeq === parsed.seq) {
+            clearTimeout(waiter.timer);
+            waiter.resolve({ channel: "project_events", payload: parsed });
+            waiter = null;
+          }
+        } catch (err: any) {
+          if (waiter) {
+            clearTimeout(waiter.timer);
+            waiter.reject(err);
+            waiter = null;
+          }
+        }
+      });
+
+      try {
+        // Aborted update transaction
+        let aborted = false;
+        try {
+          await testDb.transaction(async (tx) => {
+            await (tx.select().from(projects).where(eq(projects.id, project.id)) as any).for("update");
+            const [lockedTask] = await (tx.select().from(tasks).where(eq(tasks.id, task.id)) as any).for("update");
+
+            const [updatedTask] = await tx
+              .update(tasks)
+              .set({
+                title: "Failed Update",
+                version: lockedTask!.version + 1,
+                updatedAt: new Date(),
+              })
+              .where(eq(tasks.id, task.id))
+              .returning();
+
+            const { EventService } = await import("../../src/services/event.js");
+            const { buildTaskSnapshot, buildTaskChanges } = await import("../../src/services/task.js");
+
+            await EventService.appendProjectEvent(tx, {
+              projectId: project.id,
+              actorId: owner.user.id,
+              eventType: "task.updated",
+              entityType: "task",
+              entityId: updatedTask!.id,
+              payload: {
+                task: buildTaskSnapshot(updatedTask!),
+                changes: buildTaskChanges(lockedTask!, updatedTask!),
+              },
+            });
+
+            throw new Error("Deliberate abort after update event append");
+          });
+        } catch (err: any) {
+          if (err.message === "Deliberate abort after update event append") {
+            aborted = true;
+          }
+        }
+
+        expect(aborted).toBe(true);
+
+        // Verify task row rolled back: title is still "Task Before Update Rollback", version is still 1
+        const [dbTask] = await testDb.select().from(tasks).where(eq(tasks.id, task.id));
+        expect(dbTask!.title).toBe("Task Before Update Rollback");
+        expect(dbTask!.version).toBe(1);
+
+        // Verify sequence remains 1
+        const [dbProject] = await testDb.select().from(projects).where(eq(projects.id, project.id));
+        expect(dbProject!.lastSeq).toBe(1);
+
+        // Verify project_events has only seq 1
+        const events = await testDb.select().from(projectEvents).where(eq(projectEvents.projectId, project.id));
+        expect(events).toHaveLength(1);
+
+        // Synchronization barrier: perform successful task update via API (allocating seq 2)
+        const barrierPromise = waitForNotification(2);
+        const barrierRes = await app.request(`/api/tasks/${task.id}`, {
+          method: "PATCH",
+          headers: {
+            "Content-Type": "application/json",
+            Cookie: owner.cookie,
+          },
+          body: JSON.stringify({
+            title: "Barrier Successful Update",
+            expectedVersion: 1,
+          }),
+        });
+        expect(barrierRes.status).toBe(200);
+
+        const barrierNotification = await barrierPromise;
+        expect(barrierNotification.payload).toEqual({
+          projectId: project.id,
+          seq: 2,
+        });
+
+        // Exactly one notification was received by listener during this test block (for seq 2)
+        expect(receivedNotifications).toHaveLength(1);
+        expect(receivedNotifications[0]).toEqual({
+          projectId: project.id,
+          seq: 2,
+        });
+      } finally {
+        if (waiter) clearTimeout((waiter as any).timer);
+        await subscription.unlisten();
+      }
+    });
+  });
+
+  describe("E. Task Archival (task.archived)", () => {
+    it("emits exactly one task.archived event with snapshot reflecting archived state and archivedAt transition", async () => {
+      const { owner, project, columns } = await setupWorkspaceAndProject();
+      const colId = columns[0].id;
+
+      const createRes = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Cookie: owner.cookie,
+          "Idempotency-Key": `task-arch-init-${crypto.randomUUID()}`,
+        },
+        body: JSON.stringify({
+          title: "Task To Archive",
+          columnId: colId,
+        }),
+      });
+      const { task } = await createRes.json();
+
+      // Archive the task
+      const archiveRes = await app.request(`/api/tasks/${task.id}/archive`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Cookie: owner.cookie,
+        },
+      });
+
+      expect(archiveRes.status).toBe(200);
+      const { task: archivedTask } = await archiveRes.json();
+      expect(archivedTask.archivedAt).not.toBeNull();
+      expect(archivedTask.version).toBe(2);
+
+      const events = await testDb
+        .select()
+        .from(projectEvents)
+        .where(eq(projectEvents.projectId, project.id))
+        .orderBy(asc(projectEvents.seq));
+
+      // Exactly 2 events: task.created (seq 1) and task.archived (seq 2)
+      expect(events).toHaveLength(2);
+      const archEvent = events[1]!;
+
+      expect(archEvent.seq).toBe(2);
+      expect(archEvent.eventType).toBe("task.archived");
+      expect(archEvent.entityType).toBe("task");
+      expect(archEvent.entityId).toBe(task.id);
+      expect(archEvent.actorId).toBe(owner.user.id);
+      expect(() => taskArchivedPayloadSchema.parse(archEvent.payload)).not.toThrow();
+
+      const payload = archEvent.payload as any;
+
+      // 1. Snapshot reflects archived state with archivedAt ISO string
+      expect(payload.task.archivedAt).toBe(archivedTask.archivedAt);
+      expect(payload.task.version).toBe(2);
+
+      // 2. Changes object reflects transition from null to ISO timestamp
+      expect(payload.changes).toEqual({
+        archivedAt: { from: null, to: archivedTask.archivedAt },
+      });
+
+      // 3. Project sequence is 2
+      const [dbProject] = await testDb
+        .select()
+        .from(projects)
+        .where(eq(projects.id, project.id));
+      expect(dbProject!.lastSeq).toBe(2);
+    });
+
+    it("suppresses event emission and preserves version on repeated archive calls (idempotent no-op)", async () => {
+      const { owner, project, columns } = await setupWorkspaceAndProject();
+      const colId = columns[0].id;
+
+      const createRes = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Cookie: owner.cookie,
+          "Idempotency-Key": `task-arch-repeat-${crypto.randomUUID()}`,
+        },
+        body: JSON.stringify({
+          title: "Idempotent Archive Task",
+          columnId: colId,
+        }),
+      });
+      const { task } = await createRes.json();
+
+      // First archive call
+      const archiveRes1 = await app.request(`/api/tasks/${task.id}/archive`, {
+        method: "POST",
+        headers: { Cookie: owner.cookie },
+      });
+      expect(archiveRes1.status).toBe(200);
+      const { task: archived1 } = await archiveRes1.json();
+      expect(archived1.version).toBe(2);
+
+      const eventsCount1 = await testDb
+        .select()
+        .from(projectEvents)
+        .where(eq(projectEvents.projectId, project.id));
+      expect(eventsCount1).toHaveLength(2);
+
+      // Second archive call (idempotent no-op on already archived task)
+      const archiveRes2 = await app.request(`/api/tasks/${task.id}/archive`, {
+        method: "POST",
+        headers: { Cookie: owner.cookie },
+      });
+      expect(archiveRes2.status).toBe(200);
+      const { task: archived2 } = await archiveRes2.json();
+
+      // Version, timestamps, and rankKey are strictly preserved
+      expect(archived2.version).toBe(2);
+      expect(archived2.archivedAt).toBe(archived1.archivedAt);
+
+      // Events count in project_events remains strictly 2 (no duplicate event emitted)
+      const eventsCount2 = await testDb
+        .select()
+        .from(projectEvents)
+        .where(eq(projectEvents.projectId, project.id));
+      expect(eventsCount2).toHaveLength(2);
+
+      // Project sequence remains 2
+      const [dbProject] = await testDb
+        .select()
+        .from(projects)
+        .where(eq(projects.id, project.id));
+      expect(dbProject!.lastSeq).toBe(2);
+    });
+
+    it("rolls back task archival, event row, and sequence counter when transaction aborts before commit", async () => {
+      const { owner, project, columns } = await setupWorkspaceAndProject();
+      const colId = columns[0].id;
+
+      const createRes = await app.request(`/api/projects/${project.id}/tasks`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Cookie: owner.cookie,
+          "Idempotency-Key": `task-arch-rb-${crypto.randomUUID()}`,
+        },
+        body: JSON.stringify({
+          title: "Task Before Archive Rollback",
+          columnId: colId,
+        }),
+      });
+      const { task } = await createRes.json();
+
+      // Listener with synchronization barrier
+      const listenerClient = testSqlClient;
+      const receivedNotifications: Array<{ projectId: string; seq: number }> = [];
+
+      type NotificationEvent = { channel: string; payload: { projectId: string; seq: number } };
+      let waiter: {
+        expectedSeq: number;
+        resolve: (event: NotificationEvent) => void;
+        reject: (err: Error) => void;
+        timer: NodeJS.Timeout;
+      } | null = null;
+
+      function waitForNotification(expectedSeq: number, timeoutMs = 5000): Promise<NotificationEvent> {
+        return new Promise<NotificationEvent>((resolve, reject) => {
+          const existing = receivedNotifications.find((n) => n.seq === expectedSeq);
+          if (existing) {
+            return resolve({ channel: "project_events", payload: existing });
+          }
+
+          const timer = setTimeout(() => {
+            reject(new Error(`Timed out waiting for notification seq=${expectedSeq}`));
+          }, timeoutMs);
+
+          waiter = { expectedSeq, resolve, reject, timer };
+        });
+      }
+
+      const subscription = await listenerClient.listen("project_events", (payloadStr) => {
+        try {
+          const parsed = JSON.parse(payloadStr) as { projectId: string; seq: number };
+          receivedNotifications.push(parsed);
+
+          if (waiter && waiter.expectedSeq === parsed.seq) {
+            clearTimeout(waiter.timer);
+            waiter.resolve({ channel: "project_events", payload: parsed });
+            waiter = null;
+          }
+        } catch (err: any) {
+          if (waiter) {
+            clearTimeout(waiter.timer);
+            waiter.reject(err);
+            waiter = null;
+          }
+        }
+      });
+
+      try {
+        // Aborted archive transaction
+        let aborted = false;
+        try {
+          await testDb.transaction(async (tx) => {
+            await (tx.select().from(projects).where(eq(projects.id, project.id)) as any).for("update");
+            const [lockedTask] = await (tx.select().from(tasks).where(eq(tasks.id, task.id)) as any).for("update");
+
+            const [archivedTask] = await tx
+              .update(tasks)
+              .set({
+                archivedAt: new Date(),
+                version: lockedTask!.version + 1,
+                updatedAt: new Date(),
+              })
+              .where(eq(tasks.id, task.id))
+              .returning();
+
+            const { EventService } = await import("../../src/services/event.js");
+            const { buildTaskSnapshot, buildTaskChanges } = await import("../../src/services/task.js");
+
+            await EventService.appendProjectEvent(tx, {
+              projectId: project.id,
+              actorId: owner.user.id,
+              eventType: "task.archived",
+              entityType: "task",
+              entityId: archivedTask!.id,
+              payload: {
+                task: buildTaskSnapshot(archivedTask!),
+                changes: buildTaskChanges(lockedTask!, archivedTask!),
+              },
+            });
+
+            throw new Error("Deliberate abort after archive event append");
+          });
+        } catch (err: any) {
+          if (err.message === "Deliberate abort after archive event append") {
+            aborted = true;
+          }
+        }
+
+        expect(aborted).toBe(true);
+
+        // Verify task row rolled back: archivedAt is still null, version is still 1
+        const [dbTask] = await testDb.select().from(tasks).where(eq(tasks.id, task.id));
+        expect(dbTask!.archivedAt).toBeNull();
+        expect(dbTask!.version).toBe(1);
+
+        // Verify sequence remains 1
+        const [dbProject] = await testDb.select().from(projects).where(eq(projects.id, project.id));
+        expect(dbProject!.lastSeq).toBe(1);
+
+        // Verify project_events has only seq 1
+        const events = await testDb.select().from(projectEvents).where(eq(projectEvents.projectId, project.id));
+        expect(events).toHaveLength(1);
+
+        // Synchronization barrier: perform successful task archive via API (allocating seq 2)
+        const barrierPromise = waitForNotification(2);
+        const barrierRes = await app.request(`/api/tasks/${task.id}/archive`, {
+          method: "POST",
+          headers: { Cookie: owner.cookie },
+        });
+        expect(barrierRes.status).toBe(200);
+
+        const barrierNotification = await barrierPromise;
+        expect(barrierNotification.payload).toEqual({
+          projectId: project.id,
+          seq: 2,
+        });
+
+        // Exactly one notification was received by listener during this test block (for seq 2)
+        expect(receivedNotifications).toHaveLength(1);
+        expect(receivedNotifications[0]).toEqual({
+          projectId: project.id,
+          seq: 2,
         });
       } finally {
         if (waiter) clearTimeout((waiter as any).timer);

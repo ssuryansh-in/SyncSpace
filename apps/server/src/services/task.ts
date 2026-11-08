@@ -803,6 +803,22 @@ export class TaskService {
         });
       }
 
+      // 10. Append task.updated domain event in the same transaction
+      const snapshot = buildTaskSnapshot(updatedTask);
+      const changes = buildTaskChanges(task, updatedTask);
+
+      await EventService.appendProjectEvent(tx, {
+        projectId: project.id,
+        actorId: callerId,
+        eventType: "task.updated",
+        entityType: "task",
+        entityId: updatedTask.id,
+        payload: {
+          task: snapshot,
+          changes,
+        },
+      });
+
       return updatedTask;
     });
   }
@@ -1139,6 +1155,22 @@ export class TaskService {
       if (!archivedTask) {
         throw new Error("Failed to archive task");
       }
+
+      // 7. Append task.archived domain event in the same transaction
+      const snapshot = buildTaskSnapshot(archivedTask);
+      const changes = buildTaskChanges(task, archivedTask);
+
+      await EventService.appendProjectEvent(tx, {
+        projectId: project.id,
+        actorId: callerId,
+        eventType: "task.archived",
+        entityType: "task",
+        entityId: archivedTask.id,
+        payload: {
+          task: snapshot,
+          changes,
+        },
+      });
 
       return archivedTask;
     });
