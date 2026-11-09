@@ -58,6 +58,33 @@ const changesQuerySchema = z.object({
     }),
 });
 
+const eventsQuerySchema = z.object({
+  before: z
+    .string()
+    .min(1, "before parameter cannot be empty")
+    .regex(/^\d+$/, "before must be a positive integer")
+    .transform(Number)
+    .refine(Number.isSafeInteger, {
+      message: "before must be a safe integer",
+    })
+    .refine((val) => val > 0, {
+      message: "before must be a positive integer",
+    })
+    .optional(),
+  limit: z
+    .string()
+    .min(1, "limit parameter cannot be empty")
+    .regex(/^\d+$/, "limit must be a positive integer")
+    .transform(Number)
+    .refine(Number.isSafeInteger, {
+      message: "limit must be a safe integer",
+    })
+    .refine((val) => val > 0 && val <= 50, {
+      message: "limit must be between 1 and 50",
+    })
+    .optional(),
+});
+
 export interface ProjectRouteOptions {
   db: Database;
   auth: Auth;
@@ -185,6 +212,49 @@ export function createProjectRoutes(options: ProjectRouteOptions): Hono {
       projectId,
       callerId: user.id,
       after: parsedQuery.data.after,
+      limit: parsedQuery.data.limit,
+    });
+
+    return c.json(result, 200);
+  });
+
+  // 3.5. GET /api/projects/:projectId/events - Paginated project activity history
+  router.get("/:projectId/events", async (c) => {
+    const user = c.get("user");
+    const projectId = c.req.param("projectId");
+
+    if (!projectId || !uuidParamSchema.safeParse(projectId).success) {
+      return c.json(
+        {
+          error: {
+            code: "VALIDATION_ERROR",
+            message: "Invalid project ID",
+          },
+        },
+        400
+      );
+    }
+
+    const parsedQuery = eventsQuerySchema.safeParse(c.req.query());
+    if (!parsedQuery.success) {
+      return c.json(
+        {
+          error: {
+            code: "VALIDATION_ERROR",
+            message:
+              "Invalid query parameters: " +
+              parsedQuery.error.issues.map((i) => i.message).join(", "),
+            details: parsedQuery.error.flatten(),
+          },
+        },
+        400
+      );
+    }
+
+    const result = await EventService.getProjectEvents(db, {
+      projectId,
+      callerId: user.id,
+      before: parsedQuery.data.before,
       limit: parsedQuery.data.limit,
     });
 

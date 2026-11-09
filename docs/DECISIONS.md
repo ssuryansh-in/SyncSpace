@@ -28,9 +28,10 @@ The decisions in this section are mandatory engineering requirements established
 ---
 
 ### ADR-03: Single Unified `project_events` Table (No Outbox Table or Publication Flags)
-- **Specification Reference:** Sections 8.1, 8.4, 21.
+- **Specification Reference:** Sections 8.1, 8.4, 8.6, 10.4, 21.
 - **Confirmed Requirement:** Maintain exactly one append-only `project_events` table that serves three distinct roles: (1) audit log, (2) catch-up feed for reconnecting clients, and (3) real-time notification source. Do not maintain a separate outbox table, per-event publication flags, or claim loops (`SKIP LOCKED`).
 - **Design Rationale:** In a multi-instance architecture, a global "published" flag cannot represent per-instance delivery state (Instance A may have delivered an event while Instance B has not). Instead, each instance tracks its own in-memory cursor, and PostgreSQL provides the single ordered log.
+- **Implementation Status (Milestone 7.5 Completed):** Unified event append and retrieval verified. Both forward catch-up (`GET /api/projects/:projectId/changes`) and reverse-chronological activity history (`GET /api/projects/:projectId/events`) query the append-only `project_events` table under `REPEATABLE READ, READ ONLY` isolation using the existing composite index on `(project_id, seq)`.
 
 ---
 

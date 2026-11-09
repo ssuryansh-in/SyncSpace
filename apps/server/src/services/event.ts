@@ -1,4 +1,4 @@
-import { and, asc, eq, gt, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gt, lt, sql } from "drizzle-orm";
 import { z } from "zod";
 import type { Database } from "../db/index.js";
 import { projectEvents, projects, workspaceMembers, type ProjectEvent } from "../db/schema/index.js";
@@ -477,6 +477,111 @@ export class EventService {
       }
     );
   }
+
+  /**
+   * Retrieves paginated project activity history in reverse chronological sequence order (seq DESC).
+   * Conforms strictly to docs/SPECIFICATION.md Section 8.6, 10.4 and docs/DECISIONS.md ADR-03.
+   *
+   * Transaction & Snapshot Isolation:
+   * Executes project verification, membership check, and event retrieval inside one
+   * PostgreSQL REPEATABLE READ, READ ONLY transaction. This guarantees that currentSeq
+   * and the returned events represent the exact same MVCC snapshot.
+   *
+   * Keyset Pagination:
+   * - Reverse chronological order: ORDER BY seq DESC.
+   * - Optional exclusive cursor `before`: seq < before. When omitted, returns the latest events.
+   * - When `before > currentSeq`, gracefully returns latest available events matching seq < before
+   *   without returning 410 CURSOR_RESET.
+   * - Limit bounds: default 20, max 50.
+   * - If `before <= 1`, no events can match (seq is >= 1), returns empty list with nextCursor = null.
+   * - When hasMore is true, nextCursor is the lowest sequence in the returned page (events[events.length - 1].seq).
+   * - When hasMore is false, nextCursor is null (signaling that the beginning of event history has been reached).
+   *
+   * Tenant Concealment:
+   * Returns 404 NOT_FOUND if the project does not exist OR the caller is not an active
+   * member of the parent workspace.
+   */
+  static async getProjectEvents(
+    db: Database,
+    params: GetProjectEventsParams
+  ): Promise<ProjectEventsResult> {
+    const { projectId, callerId, before } = params;
+    const limit = params.limit ?? 20;
+
+    return await db.transaction(
+      async (tx) => {
+        // 1. Verify project exists and get current sequence
+        const [project] = await tx
+          .select({
+            id: projects.id,
+            workspaceId: projects.workspaceId,
+            lastSeq: projects.lastSeq,
+          })
+          .from(projects)
+          .where(eq(projects.id, projectId));
+
+        if (!project) {
+          throw AppError.notFound("Project not found");
+        }
+
+        // 2. Verify caller is an active member of parent workspace (tenant concealment)
+        const [membership] = await tx
+          .select({ role: workspaceMembers.role })
+          .from(workspaceMembers)
+          .where(
+            and(
+              eq(workspaceMembers.workspaceId, project.workspaceId),
+              eq(workspaceMembers.userId, callerId)
+            )
+          );
+
+        if (!membership) {
+          throw AppError.notFound("Project not found");
+        }
+
+        const currentSeq = project.lastSeq;
+
+        // 3. Boundary check: if before is specified and <= 1, no events can have seq < 1
+        if (before !== undefined && before <= 1) {
+          return {
+            events: [],
+            nextCursor: null,
+            hasMore: false,
+            currentSeq,
+          };
+        }
+
+        // 4. Build query conditions
+        const conditions = [eq(projectEvents.projectId, projectId)];
+        if (before !== undefined) {
+          conditions.push(lt(projectEvents.seq, before));
+        }
+
+        // 5. Query limit + 1 rows to detect hasMore without separate COUNT(*)
+        const rows = await tx
+          .select()
+          .from(projectEvents)
+          .where(and(...conditions))
+          .orderBy(desc(projectEvents.seq))
+          .limit(limit + 1);
+
+        const hasMore = rows.length > limit;
+        const events = hasMore ? rows.slice(0, limit) : rows;
+        const nextCursor = hasMore && events.length > 0 ? events[events.length - 1]!.seq : null;
+
+        return {
+          events,
+          nextCursor,
+          hasMore,
+          currentSeq,
+        };
+      },
+      {
+        isolationLevel: "repeatable read",
+        accessMode: "read only",
+      }
+    );
+  }
 }
 
 export interface GetProjectChangesParams {
@@ -493,6 +598,21 @@ export interface ProjectChangesResult {
   currentSeq: number;
 }
 
+export interface GetProjectEventsParams {
+  projectId: string;
+  callerId: string;
+  before?: number | undefined;
+  limit?: number | undefined;
+}
+
+export interface ProjectEventsResult {
+  events: ProjectEvent[];
+  nextCursor: number | null;
+  hasMore: boolean;
+  currentSeq: number;
+}
+
 export const appendProjectEvent = EventService.appendProjectEvent.bind(EventService);
 export const appendProjectEvents = EventService.appendProjectEvents.bind(EventService);
 export const getProjectChanges = EventService.getProjectChanges.bind(EventService);
+export const getProjectEvents = EventService.getProjectEvents.bind(EventService);

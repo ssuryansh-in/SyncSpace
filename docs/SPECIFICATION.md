@@ -283,6 +283,15 @@ presents a human-readable timeline for task creation, edits, moves,
 archive/restore, assignment changes, and comments. Event records are
 append-only during normal application operation.
 
+Clients query activity history via `GET /api/projects/:projectId/events?before=<seq>&limit=<n>`:
+- Requires authenticated project membership. Non-members and nonexistent projects receive `404 NOT_FOUND` to conceal project existence.
+- Reverse chronological sequence order (`seq DESC`).
+- Keyset pagination uses an optional exclusive cursor `before` (`seq < before`); when omitted, returns the latest events.
+- Page limit defaults to 20, with a maximum of 50. Requests with `limit > 50` or non-positive/fractional values return `400 VALIDATION_ERROR`.
+- If `before > currentSeq`, the endpoint gracefully returns latest events matching `seq < before` without `410 CURSOR_RESET`.
+- Response envelope contains `{ events, nextCursor, hasMore, currentSeq }`, where `nextCursor` is the lowest sequence in the returned page when `hasMore` is true, or `null` when the beginning of history is reached.
+- Executed inside a single PostgreSQL `REPEATABLE READ, READ ONLY` transaction guaranteeing consistent MVCC snapshot isolation between `currentSeq` and `events`.
+
 ### 6.8 AI-assisted task extraction (optional, after core correctness)
 
 The optional AI feature turns pasted meeting notes into draft task
@@ -815,9 +824,8 @@ conventions may vary, but semantics and error codes must remain stable.
 
 ### 10.4 Events and search
 
--   `GET /api/projects/:projectId/changes?after=<seq>&limit=<n>`
--   `GET /api/projects/:projectId/events?limit=<n>` --- paginated
-    activity history.
+-   `GET /api/projects/:projectId/changes?after=<seq>&limit=<n>` --- forward catch-up event stream.
+-   `GET /api/projects/:projectId/events?before=<seq>&limit=<n>` --- paginated activity history (reverse chronological `seq DESC`, default limit 20, max 50).
 -   `GET /api/projects/:projectId/search?q=<query>`
 
 ### 10.5 Error contract
