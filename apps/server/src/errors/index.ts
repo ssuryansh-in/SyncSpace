@@ -37,6 +37,13 @@ export class AppError extends Error {
     return new AppError("INVALID_STATE_TRANSITION", 422, message);
   }
 
+  static cursorReset(
+    message = "Requested event cursor is ahead of current project sequence. Reload board snapshot.",
+    details?: unknown
+  ) {
+    return new AppError("CURSOR_RESET", 410, message, details);
+  }
+
   static rateLimited(message = "Too many requests. Please try again later.") {
     return new AppError("RATE_LIMITED", 429, message);
   }

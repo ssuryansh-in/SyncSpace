@@ -1,7 +1,7 @@
-import { eq, sql } from "drizzle-orm";
+import { and, asc, eq, gt, sql } from "drizzle-orm";
 import { z } from "zod";
 import type { Database } from "../db/index.js";
-import { projectEvents, projects, type ProjectEvent } from "../db/schema/index.js";
+import { projectEvents, projects, workspaceMembers, type ProjectEvent } from "../db/schema/index.js";
 import { AppError } from "../errors/index.js";
 
 export type Transaction = Parameters<Parameters<Database["transaction"]>[0]>[0];
@@ -377,7 +377,122 @@ export class EventService {
     }
     return results;
   }
+
+  /**
+   * Retrieves paginated project events after a given sequence cursor for client catch-up.
+   * Conforms strictly to docs/SPECIFICATION.md Section 8.5 and docs/DECISIONS.md ADR-10.
+   *
+   * Transaction & Snapshot Isolation:
+   * Executes project verification, membership check, and event retrieval inside one
+   * PostgreSQL REPEATABLE READ, READ ONLY transaction. This guarantees that currentSeq
+   * and the returned events represent the exact same MVCC snapshot, eliminating phantom
+   * read desynchronization under concurrent mutations.
+   *
+   * Tenant Concealment:
+   * Returns 404 NOT_FOUND if the project does not exist OR the caller is not an active
+   * member of the parent workspace.
+   *
+   * Future Cursor Reset:
+   * Throws 410 CURSOR_RESET if `after > currentSeq`, instructing clients to discard local
+   * event buffers and reload a fresh board snapshot.
+   */
+  static async getProjectChanges(
+    db: Database,
+    params: GetProjectChangesParams
+  ): Promise<ProjectChangesResult> {
+    const { projectId, callerId, after } = params;
+    const limit = params.limit ?? 50;
+
+    return await db.transaction(
+      async (tx) => {
+        // 1. Verify project exists and get current sequence
+        const [project] = await tx
+          .select({
+            id: projects.id,
+            workspaceId: projects.workspaceId,
+            lastSeq: projects.lastSeq,
+          })
+          .from(projects)
+          .where(eq(projects.id, projectId));
+
+        if (!project) {
+          throw AppError.notFound("Project not found");
+        }
+
+        // 2. Verify caller is an active member of parent workspace (tenant concealment)
+        const [membership] = await tx
+          .select({ role: workspaceMembers.role })
+          .from(workspaceMembers)
+          .where(
+            and(
+              eq(workspaceMembers.workspaceId, project.workspaceId),
+              eq(workspaceMembers.userId, callerId)
+            )
+          );
+
+        if (!membership) {
+          throw AppError.notFound("Project not found");
+        }
+
+        const currentSeq = project.lastSeq;
+
+        // 3. Detect future cursor: after > currentSeq -> 410 CURSOR_RESET
+        if (after > currentSeq) {
+          throw AppError.cursorReset(
+            "Requested event cursor is ahead of current project sequence. Reload board snapshot.",
+            {
+              requestedSeq: after,
+              currentSeq,
+            }
+          );
+        }
+
+        // 4. Retrieve limit + 1 rows to detect hasMore without separate COUNT(*)
+        const rows = await tx
+          .select()
+          .from(projectEvents)
+          .where(
+            and(
+              eq(projectEvents.projectId, projectId),
+              gt(projectEvents.seq, after)
+            )
+          )
+          .orderBy(asc(projectEvents.seq))
+          .limit(limit + 1);
+
+        const hasMore = rows.length > limit;
+        const events = hasMore ? rows.slice(0, limit) : rows;
+        const nextCursor = events.length > 0 ? events[events.length - 1]!.seq : after;
+
+        return {
+          events,
+          nextCursor,
+          hasMore,
+          currentSeq,
+        };
+      },
+      {
+        isolationLevel: "repeatable read",
+        accessMode: "read only",
+      }
+    );
+  }
+}
+
+export interface GetProjectChangesParams {
+  projectId: string;
+  callerId: string;
+  after: number;
+  limit?: number | undefined;
+}
+
+export interface ProjectChangesResult {
+  events: ProjectEvent[];
+  nextCursor: number;
+  hasMore: boolean;
+  currentSeq: number;
 }
 
 export const appendProjectEvent = EventService.appendProjectEvent.bind(EventService);
 export const appendProjectEvents = EventService.appendProjectEvents.bind(EventService);
+export const getProjectChanges = EventService.getProjectChanges.bind(EventService);

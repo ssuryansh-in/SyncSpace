@@ -3,6 +3,7 @@ import { z } from "zod";
 import type { Database } from "../db/index.js";
 import type { Auth } from "../auth/index.js";
 import { createRequireAuth } from "../middleware/auth.js";
+import { EventService } from "../services/event.js";
 import { ProjectService } from "../services/project.js";
 import { TaskService } from "../services/task.js";
 
@@ -35,6 +36,26 @@ const createTaskSchema = z.object({
 const listTasksQuerySchema = z.object({
   columnId: z.string().uuid("Invalid column ID filter").optional(),
   assigneeId: z.string().uuid("Invalid assignee ID filter").optional(),
+});
+
+const changesQuerySchema = z.object({
+  after: z
+    .string({ required_error: "after query parameter is required" })
+    .min(1, "after query parameter cannot be empty")
+    .regex(/^\d+$/, "after query parameter must be a non-negative integer")
+    .transform(Number)
+    .refine(Number.isSafeInteger, {
+      message: "after sequence must be a safe integer",
+    }),
+  limit: z
+    .string()
+    .min(1, "limit parameter cannot be empty")
+    .regex(/^[1-9]\d*$/, "limit must be a positive integer")
+    .default("50")
+    .transform(Number)
+    .refine((val) => val <= 100, {
+      message: "limit cannot exceed 100",
+    }),
 });
 
 export interface ProjectRouteOptions {
@@ -127,7 +148,50 @@ export function createProjectRoutes(options: ProjectRouteOptions): Hono {
     return c.json(board);
   });
 
-  // 3. PATCH /api/projects/:projectId - Rename project (Owner/Admin only)
+  // 3. GET /api/projects/:projectId/changes - Catch-up event stream
+  router.get("/:projectId/changes", async (c) => {
+    const user = c.get("user");
+    const projectId = c.req.param("projectId");
+
+    if (!projectId || !uuidParamSchema.safeParse(projectId).success) {
+      return c.json(
+        {
+          error: {
+            code: "VALIDATION_ERROR",
+            message: "Invalid project ID",
+          },
+        },
+        400
+      );
+    }
+
+    const parsedQuery = changesQuerySchema.safeParse(c.req.query());
+    if (!parsedQuery.success) {
+      return c.json(
+        {
+          error: {
+            code: "VALIDATION_ERROR",
+            message:
+              "Invalid query parameters: " +
+              parsedQuery.error.issues.map((i) => i.message).join(", "),
+            details: parsedQuery.error.flatten(),
+          },
+        },
+        400
+      );
+    }
+
+    const result = await EventService.getProjectChanges(db, {
+      projectId,
+      callerId: user.id,
+      after: parsedQuery.data.after,
+      limit: parsedQuery.data.limit,
+    });
+
+    return c.json(result, 200);
+  });
+
+  // 4. PATCH /api/projects/:projectId - Rename project (Owner/Admin only)
   router.patch("/:projectId", async (c) => {
     const user = c.get("user");
     const projectId = c.req.param("projectId");
