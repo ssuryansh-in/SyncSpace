@@ -136,6 +136,14 @@ The decisions in this section are mandatory engineering requirements established
 
 ---
 
+### ADR-17: Point-in-Time Consistent Board Snapshot via REPEATABLE READ
+- **Specification Reference:** Sections 8.5, 10.2, 21.
+- **Confirmed Requirement:** `GET /api/projects/:projectId/board` must execute within a single PostgreSQL transaction configured with `isolationLevel: "repeatable read"` and `accessMode: "read only"`. The transaction reads project metadata (including `lastSeq`), workspace membership, project columns (`position ASC`), and active tasks (`archivedAt IS NULL`, `rankKey ASC, id ASC`), returning `{ project, columns, tasks, snapshotSeq: project.lastSeq }`.
+- **Design Rationale:** In a collaborative system with concurrent mutations, reading the board's task list and the project's sequence counter in separate queries or under default `READ COMMITTED` isolation allows concurrent committed writes to interleave between queries. This can produce an inconsistent state where the task list contains mutations that occurred after the sequence counter was captured (or vice versa). Under `REPEATABLE READ`, all reads see the exact same point-in-time MVCC database snapshot. The client can initialize its board state from the snapshot and seamlessly catch up missing events starting from `snapshotSeq` without lost updates or duplicate state anomalies.
+- **Implementation Status (Milestone 7.4-2 Completed):** Implemented in `ProjectService.getBoard` and exposed at `GET /api/projects/:projectId/board`. Validates workspace membership with 404 concealment, filters active tasks, orders tasks deterministically by `(rankKey ASC, id ASC)`, and returns the exact contract envelope `{ project, columns, tasks, snapshotSeq }`. Verified with 11 comprehensive integration test scenarios covering snapshot isolation against concurrent writes, unauthenticated access, tenant isolation, and membership revocation.
+
+---
+
 ## 2. Unresolved Technical Choices & Engineering Recommendations
 
 The choices in this section represent areas where the specification leaves multiple valid options open or does not mandate a single implementation detail. These are labeled as **OPEN QUESTION**, with advisory recommendations provided for team review.

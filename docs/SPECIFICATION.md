@@ -593,25 +593,27 @@ an event and fail before updating its local cursor, causing a duplicate.
 Clients deduplicate by `(project_id, seq)` and apply only contiguous
 sequences. The server must not claim exactly-once WebSocket delivery.
 
-### 8.5 Catch-up endpoint
+### 8.5 Catch-up endpoint and board snapshot
 
 `GET /api/projects/:projectId/changes?after=<seq>&limit=<n>`
 
 -   Requires authenticated project membership.
 -   Returns events with `seq > after`, sorted ascending by `seq`, capped
-    at a maximum page size.
--   Returns `nextCursor`, `hasMore`, and the current committed project
-    sequence.
+    at a maximum page size (default 50, maximum 100).
+-   Returns `events`, `nextCursor`, `hasMore`, and the current committed
+    project sequence `currentSeq`.
 -   The client advances its cursor only through a contiguous sequence of
     applied events.
 -   If the requested cursor predates retained history (retention
-    compaction is not part of v1), return a documented reset response
-    requiring a fresh project snapshot.
+    compaction is not part of v1) or exceeds the current sequence, return
+    `410 CURSOR_RESET` requiring a fresh project snapshot.
 -   Snapshot reads must return a consistent `snapshotSeq`: read
-    `projects.last_seq` and all board data inside one PostgreSQL
-    `REPEATABLE READ`, read-only transaction. The board snapshot and
-    sequence must represent the same database snapshot; clients then
-    fetch events after `snapshotSeq`.
+    `projects.last_seq`, active workspace membership, columns (`position ASC`),
+    and active tasks (`archivedAt IS NULL`, `rankKey ASC, id ASC`) inside one
+    PostgreSQL `REPEATABLE READ`, read-only transaction. The board snapshot and
+    `snapshotSeq` (which equals `project.lastSeq`) represent the same database
+    MVCC snapshot; clients initialize their state and then fetch events after
+    `snapshotSeq`.
 
 ### 8.6 Event payload and client application
 
@@ -780,7 +782,23 @@ conventions may vary, but semantics and error codes must remain stable.
 -   `PATCH /api/projects/:projectId`
 -   `POST /api/projects/:projectId/archive`
 -   `POST /api/projects/:projectId/restore`
--   `GET /api/projects/:projectId/board`
+-   `GET /api/projects/:projectId/board` --- retrieves consistent board snapshot:
+
+    ``` json
+    {
+      "project": {},
+      "columns": [],
+      "tasks": [],
+      "snapshotSeq": 15
+    }
+    ```
+
+    Executes in a single `REPEATABLE READ, READ ONLY` transaction.
+    Returns:
+    - `project`: Project metadata (including `lastSeq`).
+    - `columns`: Status columns ordered by `position ASC`.
+    - `tasks`: Active tasks (`archivedAt IS NULL`) ordered by `rankKey ASC, id ASC`.
+    - `snapshotSeq`: Canonical sequence number equal to `project.lastSeq` within the snapshot.
 
 ### 10.3 Tasks and comments
 

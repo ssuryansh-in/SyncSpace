@@ -158,7 +158,40 @@ sequenceDiagram
 
 ---
 
-### 3.3 Reconnect & Catch-Up Workflow
+### 3.3 Initial Board Hydration & Consistent Real-Time Synchronization
+
+When a client navigates to a project board, it initializes its local state from a consistent point-in-time snapshot and establishes real-time synchronization:
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Client
+    participant Server as HTTP & WS Gateway
+    participant DB as PostgreSQL (REPEATABLE READ)
+
+    Client->>Server: GET /api/projects/:projectId/board
+    Server->>DB: BEGIN TRANSACTION (REPEATABLE READ, READ ONLY)
+    Server->>DB: Query project metadata (last_seq)
+    Server->>DB: Verify caller workspace membership
+    Server->>DB: Query status columns (ORDER BY position ASC)
+    Server->>DB: Query active tasks (WHERE archived_at IS NULL ORDER BY rank_key ASC, id ASC)
+    Server->>DB: COMMIT TRANSACTION
+    DB-->>Server: Mutually consistent snapshot data (snapshotSeq = last_seq)
+    Server-->>Client: 200 OK ({ project, columns, tasks, snapshotSeq })
+    Client->>Client: Hydrate board state & initialize local cursor lastAppliedSeq = snapshotSeq
+    Client->>Server: Establish WebSocket connection & subscribe to project
+    opt Catch up missed events committed during initial connection
+        Client->>Server: GET /api/projects/:projectId/changes?after=snapshotSeq
+        Server-->>Client: 200 OK ({ events, nextCursor, hasMore, currentSeq })
+        loop For each event
+            Client->>Client: Apply contiguous event & advance lastAppliedSeq
+        end
+    end
+```
+
+---
+
+### 3.4 Reconnect & Catch-Up Workflow
 
 When a client loses network connectivity, it uses a monotonic cursor to fetch missed events upon reconnecting, preventing lost updates without requiring full state reloads.
 
@@ -174,7 +207,7 @@ sequenceDiagram
     Client->>Server: GET /api/projects/:projectId/changes?after=42&limit=50
     Server->>DB: Verify actor workspace membership
     Server->>DB: SELECT * FROM project_events WHERE project_id = :id AND seq > 42 ORDER BY seq ASC LIMIT 50
-    DB-->>Server: Return events (43..65), nextCursor=65, hasMore=false, currentProjectSeq=65
+    DB-->>Server: Return events (43..65), nextCursor=65, hasMore=false, currentSeq=65
     Server-->>Client: 200 OK (Events 43..65)
     loop For each catch-up event
         Client->>Client: Apply event sequentially to board state
@@ -187,7 +220,7 @@ If the client detects a sequence gap in the live WebSocket stream (e.g., receive
 
 ---
 
-### 3.4 Membership Revocation & Socket Eviction Flow
+### 3.5 Membership Revocation & Socket Eviction Flow
 
 Immediate revocation is enforced via a dedicated PostgreSQL channel without relying on stale in-memory permission caches.
 

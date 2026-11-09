@@ -1,6 +1,14 @@
 import { and, asc, eq, isNotNull, isNull } from "drizzle-orm";
 import type { Database } from "../db/index.js";
-import { projectColumns, projects, workspaceMembers, type Project } from "../db/schema/index.js";
+import {
+  projectColumns,
+  projects,
+  tasks,
+  workspaceMembers,
+  type Project,
+  type ProjectColumn,
+  type Task,
+} from "../db/schema/index.js";
 import { AppError } from "../errors/index.js";
 import { EventService } from "./event.js";
 
@@ -26,6 +34,13 @@ export type ProjectChanges = Record<
   string,
   { from?: unknown; to?: unknown }
 >;
+
+export interface BoardSnapshotResult {
+  project: Project;
+  columns: ProjectColumn[];
+  tasks: Task[];
+  snapshotSeq: number;
+}
 
 /**
  * Builds the canonical project snapshot carried by every project.* event.
@@ -251,8 +266,9 @@ export class ProjectService {
   }
 
   /**
-   * Retrieves board columns and project metadata.
-   * Conceals non-existent projects or non-member access with 404.
+   * Retrieves board snapshot: project metadata, status columns, active tasks, and snapshot sequence.
+   * Executes in a single REPEATABLE READ, READ ONLY transaction to guarantee point-in-time MVCC consistency.
+   * Conceals non-existent projects or non-member access with 404 (returns null).
    */
   static async getBoard(
     db: Database,
@@ -263,22 +279,60 @@ export class ProjectService {
       projectId: string;
       callerId: string;
     }
-  ) {
-    const project = await this.getProject(db, { projectId, callerId });
-    if (!project) {
-      return null;
-    }
+  ): Promise<BoardSnapshotResult | null> {
+    return await db.transaction(
+      async (tx) => {
+        // 1. Fetch project metadata (including lastSeq)
+        const [project] = await tx
+          .select()
+          .from(projects)
+          .where(eq(projects.id, projectId));
 
-    const columns = await db
-      .select()
-      .from(projectColumns)
-      .where(eq(projectColumns.projectId, projectId))
-      .orderBy(asc(projectColumns.position));
+        if (!project) {
+          return null;
+        }
 
-    return {
-      project,
-      columns,
-    };
+        // 2. Verify caller is an active member of the project's parent workspace (tenant concealment)
+        const [membership] = await tx
+          .select({ role: workspaceMembers.role })
+          .from(workspaceMembers)
+          .where(
+            and(
+              eq(workspaceMembers.workspaceId, project.workspaceId),
+              eq(workspaceMembers.userId, callerId)
+            )
+          );
+
+        if (!membership) {
+          return null;
+        }
+
+        // 3. Query columns ordered by position ASC
+        const columns = await tx
+          .select()
+          .from(projectColumns)
+          .where(eq(projectColumns.projectId, projectId))
+          .orderBy(asc(projectColumns.position));
+
+        // 4. Query active tasks (archivedAt IS NULL) ordered by rankKey ASC, id ASC
+        const activeTasks = await tx
+          .select()
+          .from(tasks)
+          .where(and(eq(tasks.projectId, projectId), isNull(tasks.archivedAt)))
+          .orderBy(asc(tasks.rankKey), asc(tasks.id));
+
+        return {
+          project,
+          columns,
+          tasks: activeTasks,
+          snapshotSeq: project.lastSeq,
+        };
+      },
+      {
+        isolationLevel: "repeatable read",
+        accessMode: "read only",
+      }
+    );
   }
 
   /**
