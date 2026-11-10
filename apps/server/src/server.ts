@@ -5,8 +5,9 @@ import path from "node:path";
 import type { Hono } from "hono";
 import { createApp } from "./app.js";
 import { loadEnv, type EnvConfig } from "./config/env.js";
-import { closeDb } from "./db/index.js";
+import { closeDb, getDb } from "./db/index.js";
 import { PostgresListenerService } from "./services/listener.js";
+import { MembershipConsumerService } from "./services/membership-consumer.js";
 
 export interface StartServerOptions {
   config?: Partial<EnvConfig>;
@@ -14,6 +15,7 @@ export interface StartServerOptions {
   registerSignalHandlers?: boolean;
   app?: Hono;
   listener?: PostgresListenerService | null;
+  membershipConsumer?: MembershipConsumerService | null;
 }
 
 export interface ServerHandle {
@@ -21,6 +23,7 @@ export interface ServerHandle {
   port: number;
   stop: () => Promise<void>;
   listener?: PostgresListenerService;
+  membershipConsumer?: MembershipConsumerService;
 }
 
 /**
@@ -57,11 +60,29 @@ export async function startServer(
     }
   }
 
+  let membershipConsumer: MembershipConsumerService | null = null;
+  if (options.membershipConsumer !== null) {
+    if (options.membershipConsumer) {
+      membershipConsumer = options.membershipConsumer;
+    } else if (listener && typeof listener.onMembershipChange === "function") {
+      membershipConsumer = new MembershipConsumerService({
+        db: getDb(),
+        listener,
+      });
+    }
+  }
+
   // Await dedicated PostgreSQL listener startup before binding network port if configured
   if (listener) {
     try {
       await listener.start();
+      if (membershipConsumer) {
+        membershipConsumer.start();
+      }
     } catch (err) {
+      if (membershipConsumer) {
+        await membershipConsumer.stop().catch(() => {});
+      }
       await listener.stop().catch(() => {});
       throw err;
     }
@@ -88,6 +109,9 @@ export async function startServer(
       const onStartupError = async (err: Error) => {
         if (!isStarted) {
           nodeServer.off("listening", onListening);
+          if (membershipConsumer) {
+            await membershipConsumer.stop().catch(() => {});
+          }
           if (listener) {
             await listener.stop().catch(() => {});
           }
@@ -160,12 +184,17 @@ export async function startServer(
             }
           });
 
-          // 2. Unlisten from PostgreSQL notification channels
+          // 2. Stop membership consumer if running
+          if (membershipConsumer) {
+            await membershipConsumer.stop();
+          }
+
+          // 3. Unlisten from PostgreSQL notification channels
           if (listener) {
             await listener.stop();
           }
 
-          // 3. Close database connection pool with bounded timeout (2s)
+          // 4. Close database connection pool with bounded timeout (2s)
           await closeDb();
 
           // Remove signal handlers upon shutdown completion if they were registered
@@ -204,6 +233,7 @@ export async function startServer(
         port: boundPort,
         stop,
         ...(listener ? { listener } : {}),
+        ...(membershipConsumer ? { membershipConsumer } : {}),
       });
     };
 
@@ -211,6 +241,9 @@ export async function startServer(
     nodeServer.once("listening", onListening);
   });
 } catch (err) {
+  if (membershipConsumer) {
+    await membershipConsumer.stop().catch(() => {});
+  }
   if (listener) {
     await listener.stop().catch(() => {});
   }

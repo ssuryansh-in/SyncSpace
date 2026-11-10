@@ -78,7 +78,7 @@ flowchart TD
 ### 2.4 Data Access Layer (Drizzle ORM & PostgreSQL Connections)
 - **Unified Drizzle Schema & Migration Pipeline:** Both domain tables (`users`, `workspaces`, `tasks`, etc.) and Better Auth tables (`sessions`, `accounts`, `verifications`) are managed under a single unified Drizzle ORM schema and migration pipeline (`0000_futuristic_brood.sql`, `0001_auth_tables.sql`).
 - **Primary Connection Pool:** Used for ordinary application queries, REST endpoints, and transactional domain mutations. Runs under PostgreSQL `READ COMMITTED` isolation.
-- **Dedicated Listener Connection:** A dedicated, long-lived PostgreSQL connection reserved exclusively for `LISTEN` subscriptions (`project_events` and `membership_changes`). This connection bypasses transaction-level pooling proxies (e.g., PgBouncer transaction mode) because `LISTEN` is session-scoped.
+- **Dedicated Listener Connection & Consumer Reconciler:** A dedicated, long-lived PostgreSQL connection reserved exclusively for `LISTEN` subscriptions (`project_events` and `membership_changes`). This connection bypasses transaction-level pooling proxies (e.g., PgBouncer transaction mode) because `LISTEN` is session-scoped. Incoming signals on `membership_changes` are handled by `MembershipConsumerService`, which performs authoritative point-in-time state reconciliation against `workspace_members` in PostgreSQL before dispatching domain events (`revoked`, `role_updated`, `added`). Reconciled events are point-in-time observations, preserving the requirement for WebSocket delivery loops to independently verify membership in PostgreSQL immediately before delivering project data.
 
 ### 2.5 Unified Project Event & Delivery Subsystem
 - **Single Canonical Table:** `project_events` acts simultaneously as the audit log, catch-up replay feed, and real-time notification source.
@@ -222,7 +222,7 @@ If the client detects a sequence gap in the live WebSocket stream (e.g., receive
 
 ### 3.5 Membership Revocation & Socket Eviction Flow
 
-Immediate revocation is enforced via a dedicated PostgreSQL channel without relying on stale in-memory permission caches.
+Immediate revocation is enforced via a dedicated PostgreSQL channel without relying on stale in-memory permission caches. Incoming notifications act as edge triggers prompting point-in-time reconciliation against PostgreSQL before dispatching revocation signals.
 
 ```mermaid
 sequenceDiagram
@@ -231,6 +231,7 @@ sequenceDiagram
     participant Server as Application Server
     participant DB as PostgreSQL
     participant Listener as Dedicated LISTEN Connection
+    participant Consumer as MembershipConsumerService
     participant WSManager as WebSocket Connection Manager
     actor RevokedMember as Revoked Member Client
 
@@ -240,7 +241,10 @@ sequenceDiagram
     Server->>DB: pg_notify('membership_changes', payload: { workspaceId, affectedUsers: [{ userId, action: 'removed' }] })
     Server->>DB: COMMIT TRANSACTION
     DB-->>Listener: NOTIFY 'membership_changes'
-    Listener->>WSManager: Invalidate user sessions for workspace
+    Listener->>Consumer: onMembershipChange(payload)
+    Consumer->>DB: SELECT role FROM workspace_members WHERE workspace_id = :wsId AND user_id = :userId
+    DB-->>Consumer: Returns isMember === false
+    Consumer->>WSManager: onEvent({ type: 'revoked', workspaceId, userId })
     WSManager->>RevokedMember: Terminate active project subscriptions & disconnect socket
     RevokedMember-->>WSManager: Connection Closed
 ```

@@ -145,6 +145,19 @@ The decisions in this section are mandatory engineering requirements established
 
 ---
 
+### ADR-18: Notifications as Triggers for Authoritative Current-State Reconciliation
+- **Specification Reference:** Sections 6.6, 12, 13.1, 13.3, 21.
+- **Confirmed Requirement:** Membership change notifications emitted on `membership_changes` act as edge triggers, not state authority. The consumer (`MembershipConsumerService`) authoritatively queries PostgreSQL `workspace_members` point-in-time before dispatching domain events (`revoked`, `role_updated`, `added`).
+- **Design Rationale:**
+  1. **Stale Removal Protection:** In an asynchronous notification pipeline, a delayed `removed` notification can arrive after a user has already been re-added in PostgreSQL. By verifying current state against `workspace_members`, the consumer detects active membership and suppresses false revocation, preventing accidental lockout of valid members.
+  2. **Stale Role Update Handling:** A delayed `role_updated` notification arriving after a member was removed detects absence in PostgreSQL and safely converts the event into a `revoked` dispatch.
+  3. **Transient DB Error Safety:** Transient database lookup errors (e.g. connection timeout or pool exhaustion) must **never** be interpreted as absence of membership. The error is logged and dispatch is skipped to prevent transient network glitches from triggering false revocations.
+  4. **Query-to-Dispatch Race Defense:** Because a mutation can commit between the database lookup and event dispatch, reconciled events are strictly point-in-time observations, not permanent authorization decisions. As specified in Section 6.6, M8.4's fresh PostgreSQL membership check immediately before delivery serves as the mandatory authorization gate. While no non-atomic check can mathematically eliminate every theoretical race between authorization verification and network packet transmission, this pre-delivery query strongly mitigates the query-to-send race without introducing distributed locks or transactional bottlenecks around WebSockets.
+  5. **Per-User FIFO Serialization:** Asynchronous notifications affecting the same user are serialized in strict FIFO order using fine-grained promise chains (`workspaceId:userId`). This guarantees that earlier notifications settle before later ones begin processing, while independent users and workspaces process concurrently in parallel.
+- **Implementation Status (Milestone 8.2.2 Completed):** Implemented in `MembershipConsumerService` (`apps/server/src/services/membership-consumer.ts`) and integrated into `startServer` / graceful shutdown in `apps/server/src/server.ts`. Verified with 15 deterministic unit test scenarios (using deferred promise barriers) and 6 real PostgreSQL integration test scenarios.
+
+---
+
 ## 2. Unresolved Technical Choices & Engineering Recommendations
 
 The choices in this section represent areas where the specification leaves multiple valid options open or does not mandate a single implementation detail. These are labeled as **OPEN QUESTION**, with advisory recommendations provided for team review.
