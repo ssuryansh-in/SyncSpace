@@ -15,26 +15,27 @@ export const projectEventNotificationSchema = z
 
 export type ProjectEventNotification = z.infer<typeof projectEventNotificationSchema>;
 
-export const membershipActionSchema = z.enum(["removed", "role_updated", "added"]);
-export type MembershipAction = z.infer<typeof membershipActionSchema>;
+import {
+  MEMBERSHIP_CHANNEL,
+  MAX_MEMBERSHIP_NOTIFICATION_BYTES,
+  membershipActionSchema,
+  type MembershipAction,
+  membershipAffectedUserSchema,
+  type MembershipAffectedUser,
+  membershipChangeNotificationSchema,
+  type MembershipChangeNotification,
+} from "../schemas/membership-notification.js";
 
-export const membershipAffectedUserSchema = z
-  .object({
-    userId: z.string().uuid(),
-    action: membershipActionSchema,
-  })
-  .strict();
-
-export type MembershipAffectedUser = z.infer<typeof membershipAffectedUserSchema>;
-
-export const membershipChangeNotificationSchema = z
-  .object({
-    workspaceId: z.string().uuid(),
-    affectedUsers: z.array(membershipAffectedUserSchema).min(1).max(500),
-  })
-  .strict();
-
-export type MembershipChangeNotification = z.infer<typeof membershipChangeNotificationSchema>;
+export {
+  MEMBERSHIP_CHANNEL,
+  MAX_MEMBERSHIP_NOTIFICATION_BYTES,
+  membershipActionSchema,
+  type MembershipAction,
+  membershipAffectedUserSchema,
+  type MembershipAffectedUser,
+  membershipChangeNotificationSchema,
+  type MembershipChangeNotification,
+};
 
 export type ListenerStatus = "stopped" | "starting" | "ready";
 
@@ -461,10 +462,11 @@ export class PostgresListenerService {
       return;
     }
 
-    // Guard against oversized payload (PostgreSQL NOTIFY max payload is 8000 bytes)
-    if (typeof raw !== "string" || raw.length > 8000) {
+    // Guard against oversized payload (PostgreSQL NOTIFY max payload is < 8000 bytes)
+    const byteLength = typeof raw === "string" ? Buffer.byteLength(raw, "utf8") : 0;
+    if (typeof raw !== "string" || byteLength >= MAX_MEMBERSHIP_NOTIFICATION_BYTES) {
       this.logger.warn(
-        { length: typeof raw === "string" ? raw.length : 0 },
+        { byteLength, length: typeof raw === "string" ? raw.length : 0 },
         "Oversized or non-string payload rejected on project_events channel"
       );
       return;
@@ -475,7 +477,7 @@ export class PostgresListenerService {
       parsed = JSON.parse(raw);
     } catch {
       this.logger.warn(
-        { length: raw.length },
+        { byteLength, length: raw.length },
         "Malformed JSON on project_events channel"
       );
       return;
@@ -484,7 +486,7 @@ export class PostgresListenerService {
     const result = projectEventNotificationSchema.safeParse(parsed);
     if (!result.success) {
       this.logger.warn(
-        { length: raw.length, issueCount: result.error.issues.length },
+        { byteLength, length: raw.length, issueCount: result.error.issues.length },
         "Invalid payload structure on project_events channel"
       );
       return;
@@ -498,10 +500,11 @@ export class PostgresListenerService {
       return;
     }
 
-    // Guard against oversized payload (PostgreSQL NOTIFY max payload is 8000 bytes)
-    if (typeof raw !== "string" || raw.length > 8000) {
+    // Guard against oversized payload (PostgreSQL NOTIFY max payload is < 8000 bytes)
+    const byteLength = typeof raw === "string" ? Buffer.byteLength(raw, "utf8") : 0;
+    if (typeof raw !== "string" || byteLength >= MAX_MEMBERSHIP_NOTIFICATION_BYTES) {
       this.logger.warn(
-        { length: typeof raw === "string" ? raw.length : 0 },
+        { byteLength, length: typeof raw === "string" ? raw.length : 0 },
         "Oversized or non-string payload rejected on membership_changes channel"
       );
       return;
@@ -512,7 +515,7 @@ export class PostgresListenerService {
       parsed = JSON.parse(raw);
     } catch {
       this.logger.warn(
-        { length: raw.length },
+        { byteLength, length: raw.length },
         "Malformed JSON on membership_changes channel"
       );
       return;
@@ -521,7 +524,7 @@ export class PostgresListenerService {
     const result = membershipChangeNotificationSchema.safeParse(parsed);
     if (!result.success) {
       this.logger.warn(
-        { length: raw.length, issueCount: result.error.issues.length },
+        { byteLength, length: raw.length, issueCount: result.error.issues.length },
         "Invalid payload structure on membership_changes channel"
       );
       return;

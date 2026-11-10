@@ -2,6 +2,7 @@ import { and, eq } from "drizzle-orm";
 import type { Database } from "../db/index.js";
 import { users, workspaceMembers, workspaces } from "../db/schema/index.js";
 import { AppError } from "../errors/index.js";
+import { emitMembershipNotification } from "./membership-events.js";
 
 /**
  * Domain service managing workspace membership additions, role updates, and removals.
@@ -27,68 +28,82 @@ export class MembershipService {
       role?: "admin" | "member";
     }
   ) {
-    // 1. Verify caller membership and role
-    const [callerMembership] = await db
-      .select()
-      .from(workspaceMembers)
-      .where(
-        and(
-          eq(workspaceMembers.workspaceId, workspaceId),
-          eq(workspaceMembers.userId, callerId)
+    return await db.transaction(async (tx) => {
+      // 1. Lock workspace row first to conform to established lock hierarchy
+      // (workspaces -> projects -> columns -> tasks -> comments)
+      const [workspace] = await tx
+        .select({ id: workspaces.id, ownerId: workspaces.ownerId })
+        .from(workspaces)
+        .where(eq(workspaces.id, workspaceId))
+        .for("update");
+
+      if (!workspace) {
+        throw AppError.notFound("Workspace not found");
+      }
+
+      // 2. Lock and verify caller membership and role FOR UPDATE (404 concealment for non-members)
+      const [callerMembership] = await tx
+        .select({ role: workspaceMembers.role })
+        .from(workspaceMembers)
+        .where(
+          and(
+            eq(workspaceMembers.workspaceId, workspaceId),
+            eq(workspaceMembers.userId, callerId)
+          )
         )
-      );
+        .for("update");
 
-    if (!callerMembership) {
-      throw AppError.notFound("Workspace not found");
-    }
+      if (!callerMembership) {
+        throw AppError.notFound("Workspace not found");
+      }
 
-    if (callerMembership.role !== "owner" && callerMembership.role !== "admin") {
-      throw AppError.forbidden("Only owners and admins can add members to the workspace");
-    }
+      if (callerMembership.role !== "owner" && callerMembership.role !== "admin") {
+        throw AppError.forbidden("Only owners and admins can add members to the workspace");
+      }
 
-    const assignedRole = role === "admin" ? "admin" : "member";
-    const genericResponse = {
-      status: true,
-      message: "If the user is registered, they have been added to the workspace.",
-    };
+      const assignedRole = role === "admin" ? "admin" : "member";
+      const genericResponse = {
+        status: true,
+        message: "If the user is registered, they have been added to the workspace.",
+      };
 
-    // 2. Lookup user by email (case-insensitive via citext)
-    const [targetUser] = await db
-      .select()
-      .from(users)
-      .where(eq(users.email, email.trim()));
+      // 3. Lookup user by email (case-insensitive via citext)
+      const [targetUser] = await tx
+        .select({ id: users.id, emailVerified: users.emailVerified })
+        .from(users)
+        .where(eq(users.email, email.trim()));
 
-    // Do not reveal whether user exists or is verified
-    if (!targetUser || !targetUser.emailVerified) {
+      // Account enumeration protection: suppress notification and return generic response
+      if (!targetUser || !targetUser.emailVerified) {
+        return genericResponse;
+      }
+
+      // 4. Insert membership with conflict suppression for concurrent duplicate requests
+      const [inserted] = await tx
+        .insert(workspaceMembers)
+        .values({
+          workspaceId,
+          userId: targetUser.id,
+          role: assignedRole,
+        })
+        .onConflictDoNothing()
+        .returning({ userId: workspaceMembers.userId });
+
+      // 5. Emit notification ONLY if row was genuinely inserted (not on duplicate / conflict)
+      if (inserted) {
+        await emitMembershipNotification(tx, {
+          workspaceId,
+          affectedUsers: [
+            {
+              userId: targetUser.id,
+              action: "added",
+            },
+          ],
+        });
+      }
+
       return genericResponse;
-    }
-
-    // 3. Check if already a member
-    const [existingMember] = await db
-      .select()
-      .from(workspaceMembers)
-      .where(
-        and(
-          eq(workspaceMembers.workspaceId, workspaceId),
-          eq(workspaceMembers.userId, targetUser.id)
-        )
-      );
-
-    if (existingMember) {
-      return genericResponse;
-    }
-
-    // 4. Insert membership with conflict suppression for concurrent duplicate requests
-    await db
-      .insert(workspaceMembers)
-      .values({
-        workspaceId,
-        userId: targetUser.id,
-        role: assignedRole,
-      })
-      .onConflictDoNothing();
-
-    return genericResponse;
+    });
   }
 
   /**
@@ -189,6 +204,19 @@ export class MembershipService {
         )
         .returning();
 
+      // Emit notification only on genuine role change (suppress no-op)
+      if (targetMembership.role !== newRole) {
+        await emitMembershipNotification(tx, {
+          workspaceId,
+          affectedUsers: [
+            {
+              userId: targetUserId,
+              action: "role_updated",
+            },
+          ],
+        });
+      }
+
       return updatedMember;
     });
   }
@@ -285,6 +313,16 @@ export class MembershipService {
             eq(workspaceMembers.userId, targetUserId)
           )
         );
+
+      await emitMembershipNotification(tx, {
+        workspaceId,
+        affectedUsers: [
+          {
+            userId: targetUserId,
+            action: "removed",
+          },
+        ],
+      });
 
       return {
         status: true,

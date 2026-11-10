@@ -47,5 +47,9 @@ export class AppError extends Error {
   static rateLimited(message = "Too many requests. Please try again later.") {
     return new AppError("RATE_LIMITED", 429, message);
   }
+
+  static internal(message = "Internal server error", details?: unknown) {
+    return new AppError("INTERNAL_ERROR", 500, message, details);
+  }
 }
 

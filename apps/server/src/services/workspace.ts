@@ -2,6 +2,7 @@ import { and, asc, eq } from "drizzle-orm";
 import type { Database } from "../db/index.js";
 import { users, workspaceMembers, workspaces } from "../db/schema/index.js";
 import { AppError } from "../errors/index.js";
+import { emitMembershipNotification } from "./membership-events.js";
 
 export interface WorkspaceMemberInfo {
   userId: string;
@@ -262,6 +263,15 @@ export class WorkspaceService {
             eq(workspaceMembers.userId, newOwnerId)
           )
         );
+
+      // 6. Emit single notification containing both affected users
+      await emitMembershipNotification(tx, {
+        workspaceId,
+        affectedUsers: [
+          { userId: currentOwnerId, action: "role_updated" },
+          { userId: newOwnerId, action: "role_updated" },
+        ],
+      });
 
       return {
         workspace: updatedWorkspace,

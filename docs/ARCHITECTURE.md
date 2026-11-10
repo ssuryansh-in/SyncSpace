@@ -237,7 +237,7 @@ sequenceDiagram
     Admin->>Server: DELETE /api/workspaces/:wsId/members/:userId
     Server->>DB: BEGIN TRANSACTION
     Server->>DB: DELETE FROM workspace_members WHERE workspace_id = :wsId AND user_id = :userId
-    Server->>DB: pg_notify('membership_changes', payload: { workspaceId, userId, action: 'removed' })
+    Server->>DB: pg_notify('membership_changes', payload: { workspaceId, affectedUsers: [{ userId, action: 'removed' }] })
     Server->>DB: COMMIT TRANSACTION
     DB-->>Listener: NOTIFY 'membership_changes'
     Listener->>WSManager: Invalidate user sessions for workspace
