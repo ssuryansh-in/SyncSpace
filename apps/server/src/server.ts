@@ -6,18 +6,21 @@ import type { Hono } from "hono";
 import { createApp } from "./app.js";
 import { loadEnv, type EnvConfig } from "./config/env.js";
 import { closeDb } from "./db/index.js";
+import { PostgresListenerService } from "./services/listener.js";
 
 export interface StartServerOptions {
   config?: Partial<EnvConfig>;
   shutdownTimeoutMs?: number;
   registerSignalHandlers?: boolean;
   app?: Hono;
+  listener?: PostgresListenerService | null;
 }
 
 export interface ServerHandle {
   host: string;
   port: number;
   stop: () => Promise<void>;
+  listener?: PostgresListenerService;
 }
 
 /**
@@ -45,23 +48,52 @@ export async function startServer(
   const shutdownTimeoutMs = options.shutdownTimeoutMs ?? 5000;
   const registerSignals = options.registerSignalHandlers ?? false;
 
-  return new Promise<ServerHandle>((resolve, reject) => {
-    let isStarted = false;
+  let listener: PostgresListenerService | null = null;
+  if (options.listener !== null) {
+    if (options.listener) {
+      listener = options.listener;
+    } else if (env.DATABASE_URL) {
+      listener = new PostgresListenerService();
+    }
+  }
 
-    // Start network server using @hono/node-server
-    const nodeServer = serve({
-      fetch: app.fetch,
-      port: env.PORT,
-      hostname: env.HOST,
-    });
+  // Await dedicated PostgreSQL listener startup before binding network port if configured
+  if (listener) {
+    try {
+      await listener.start();
+    } catch (err) {
+      await listener.stop().catch(() => {});
+      throw err;
+    }
+  }
 
-    // Cleanup listeners and reject if startup encounters an error (e.g. EADDRINUSE)
-    const onStartupError = (err: Error) => {
-      if (!isStarted) {
-        nodeServer.off("listening", onListening);
+  try {
+    return await new Promise<ServerHandle>((resolve, reject) => {
+      let isStarted = false;
+
+      // Start network server using @hono/node-server
+      let nodeServer: ReturnType<typeof serve>;
+      try {
+        nodeServer = serve({
+          fetch: app.fetch,
+          port: env.PORT,
+          hostname: env.HOST,
+        });
+      } catch (err) {
         reject(err);
+        return;
       }
-    };
+
+      // Cleanup listeners and reject if startup encounters an error (e.g. EADDRINUSE)
+      const onStartupError = async (err: Error) => {
+        if (!isStarted) {
+          nodeServer.off("listening", onListening);
+          if (listener) {
+            await listener.stop().catch(() => {});
+          }
+          reject(err);
+        }
+      };
 
     const onListening = () => {
       isStarted = true;
@@ -128,7 +160,12 @@ export async function startServer(
             }
           });
 
-          // 2. Close database connection pool with bounded timeout (2s)
+          // 2. Unlisten from PostgreSQL notification channels
+          if (listener) {
+            await listener.stop();
+          }
+
+          // 3. Close database connection pool with bounded timeout (2s)
           await closeDb();
 
           // Remove signal handlers upon shutdown completion if they were registered
@@ -166,12 +203,19 @@ export async function startServer(
         host: boundHost,
         port: boundPort,
         stop,
+        ...(listener ? { listener } : {}),
       });
     };
 
     nodeServer.once("error", onStartupError);
     nodeServer.once("listening", onListening);
   });
+} catch (err) {
+  if (listener) {
+    await listener.stop().catch(() => {});
+  }
+  throw err;
+}
 }
 
 // Direct execution entry point

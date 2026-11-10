@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
+import { Hono } from "hono";
 import { startServer, type ServerHandle } from "../src/server.js";
 import { createApp } from "../src/app.js";
+import type { PostgresListenerService } from "../src/services/listener.js";
 
 describe("HTTP Server Lifecycle & Graceful Shutdown", () => {
   it("starts successfully on an ephemeral port and responds to real HTTP requests", async () => {
@@ -145,6 +147,40 @@ describe("HTTP Server Lifecycle & Graceful Shutdown", () => {
 
     // Subsequent requests must fail to connect
     await expect(fetch(url)).rejects.toThrow();
+  });
+
+  it("stops listener and propagates error when HTTP server creation fails synchronously", async () => {
+    let startCalled = false;
+    let stopCalled = false;
+
+    const mockListener = {
+      start: async () => {
+        startCalled = true;
+      },
+      stop: async () => {
+        stopCalled = true;
+      },
+      status: "ready",
+    } as unknown as PostgresListenerService;
+
+    // Provide a minimal Hono app to isolate network server binding from Better Auth URL initialization
+    const minimalApp = new Hono();
+
+    await expect(
+      startServer({
+        app: minimalApp,
+        config: {
+          NODE_ENV: "test",
+          PORT: -1, // Triggers synchronous RangeError in nodeServer creation
+          HOST: "127.0.0.1",
+        },
+        listener: mockListener,
+        registerSignalHandlers: false,
+      })
+    ).rejects.toThrow(/port should be >= 0 and < 65536/i);
+
+    expect(startCalled).toBe(true);
+    expect(stopCalled).toBe(true);
   });
 });
 
