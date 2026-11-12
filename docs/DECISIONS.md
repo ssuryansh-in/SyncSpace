@@ -158,6 +158,47 @@ The decisions in this section are mandatory engineering requirements established
 
 ---
 
+### ADR-19: DeliveryEngine Architecture, Concurrent Fan-Out, and Fail-Closed Pre-Dispatch Authorization
+- **Specification Reference:** Sections 6.6, 8.4, 8.5, 12, 13.1, 13.2, 13.3, 21.
+- **Confirmed Requirement:** Implement a per-instance in-memory project event delivery engine (`DeliveryEngine`) responsible for real-time dispatch of committed events to locally connected subscriber sockets.
+- **Architectural Rules & Invariants:**
+  1. **Subscription Registration & Protocol C Handoff:**
+     - The first subscriber for a project loads the authoritative `projects.last_seq` from PostgreSQL as initial `localLastDeliveredSeq` and triggers an immediate catch-up drain for any events committed during registration.
+     - Subsequent subscribers register into the active project state and receive `currentSeq` captured from `projects.last_seq` in PostgreSQL. Clients use `currentSeq` to fetch missing events via `GET /api/projects/:projectId/changes?after=<snapshotSeq>` while buffering live events.
+  2. **Per-Project Single Drain Lock & Coalescing:**
+     - Strictly one asynchronous drain loop (`activeDrain`) executes per project at any moment.
+     - Concurrent wake-ups (`NOTIFY`), polling triggers, or registration drains coalesce by setting `pendingDrain = true`.
+     - When the active drain finishes, if `pendingDrain` is true and the engine is running, another drain iteration executes immediately.
+     - Projects with zero active subscribers are automatically cleaned up from memory when no drain is running.
+  3. **Pre-Dispatch PostgreSQL Authorization Gate (Fail-Closed):**
+     - Before fanning out each individual event (inside `dispatchSingleEvent`), the engine performs a fresh batched query against PostgreSQL `workspace_members` for all distinct subscriber user IDs.
+     - If the database query encounters a transient error, event dispatch is halted and the project cursor is frozen (`localLastDeliveredSeq` is not advanced), failing closed.
+     - While this point-in-time check strongly mitigates unauthorized delivery, it cannot recall an already-authorized in-flight send or eliminate the theoretical query-to-TCP race.
+     - Subscribers whose membership is confirmed absent in PostgreSQL are evicted and closed without receiving event data.
+  4. **Concurrent Fan-Out & Option A Bounded Send Timeout:**
+     - Fan-out to eligible subscribers executes concurrently using `Promise.allSettled`, isolating synchronous throws and asynchronous rejections so one failing or slow subscriber cannot delay or prevent delivery to healthy subscribers.
+     - A per-subscriber shutdown guard checks `isShuttingDown` immediately before each individual subscriber send; any send skipped due to shutdown is neither treated as an error nor evicted as a failure.
+     - Subscriber sends are bounded by a configurable timeout (default 5000 ms). If a subscriber rejects or times out, it is evicted and closed idempotently.
+     - Late promises are tracked so late resolution or rejection cannot mutate delivery state, advance cursors independently, or leak unhandled promise rejections.
+     - The project cursor `localLastDeliveredSeq` is advanced strictly after all send promises settle and the engine verifies it is not shutting down.
+  5. **Periodic Single-Flight Polling Fallback:**
+     - A background polling loop runs nominally every 1 second (configurable).
+     - A single-flight guard (`isPolling`) prevents overlapping polling sweeps.
+     - The loop iterates active projects with registered subscribers and triggers drain cycles, which query `project_events` for sequences beyond `localLastDeliveredSeq`. Missed NOTIFY signals are recovered on the next successful polling cycle, which runs nominally every second. Database or polling failures may delay recovery until a subsequent successful cycle.
+  6. **Tenant-Scoped Revocation Eviction:**
+     - The engine integrates with `MembershipConsumerService`'s `revoked` domain events to immediately evict matching subscriber sockets across active projects in that workspace.
+  7. **Graceful Shutdown Lifecycle:**
+     - Checks `isShuttingDown` at subscription entry, drain start, per-event batch processing, immediately before each individual subscriber's send, and prior to cursor advancement.
+     - When `stop()` is invoked, active drains are awaited up to `shutdownTimeoutMs`. If drains settle before the timeout, the timeout handle is cleared immediately via `try/finally` cleanup, and remaining subscribers are closed cleanly without orphan timers or background operations.
+- **Design Rationale & Trade-offs:**
+  - Preserves PostgreSQL as the single source of truth without external message brokers (ADR-02).
+  - Pre-dispatch query strongly mitigates the query-to-send race window without requiring distributed locks or transactional bottlenecks around WebSockets; however, like any non-atomic check, it cannot recall already-authorized in-flight sends or eliminate the query-to-TCP race.
+  - Bounded send timeout protects server event loop and database connections from client backpressure.
+  - In-memory cursor `localLastDeliveredSeq` ensures only locally relevant projects are tracked, and inactive projects consume zero server memory.
+- **Implementation Status (Milestone 8.3 Completed):** Implemented in `DeliveryEngine` (`apps/server/src/services/delivery.ts`) and integrated into `startServer` / graceful shutdown in `apps/server/src/server.ts`. Verified with 13 unit test scenarios and 7 real PostgreSQL integration test scenarios.
+
+---
+
 ## 2. Unresolved Technical Choices & Engineering Recommendations
 
 The choices in this section represent areas where the specification leaves multiple valid options open or does not mandate a single implementation detail. These are labeled as **OPEN QUESTION**, with advisory recommendations provided for team review.
@@ -209,11 +250,11 @@ The choices in this section represent areas where the specification leaves multi
 ---
 
 ### OPEN QUESTION 5: Race Condition Between Membership Revocation and In-Flight WebSocket Delivery
-- **Specification Status:** **UNRESOLVED IN SPECIFICATION & IMPLEMENTATION.**
+- **Specification Status:** **PARTIALLY RESOLVED IN ENGINE (M8.3); PENDING TRANSPORT INTEGRATION (M8.4).**
   - Sections 6.6, 12, 13.1, and 21 require immediate revocation of workspace access and socket disconnection upon membership removal or role demotion.
 - **Open Security Dilemma:**
   - When a user's workspace membership is revoked or demoted in PostgreSQL, a concurrent in-flight WebSocket delivery loop on another thread or process instance could potentially dispatch an event immediately before receiving or processing the `membership_changes` notification.
   - A batched PostgreSQL membership query has been discussed as a potential performance optimization, but caching or batching must not weaken the strict authorization guarantee required by the specification.
 - **Engineering Status:**
-  - This security question is **strictly unresolved**.
-  - It will not be marked as resolved, nor will an unverified workaround be accepted, without an explicitly defined concurrency guarantee and latch-based integration tests verifying behavior under race conditions.
+  - In Milestone M8.3, `DeliveryEngine` implemented the fail-closed pre-dispatch authorization gate against PostgreSQL `workspace_members` (`dispatchSingleEvent`) immediately prior to event fan-out, accompanied by instant eviction upon `revoked` notification from `MembershipConsumerService`. This was verified with real PostgreSQL integration tests under race conditions where membership was removed directly in the database prior to event dispatch. While this point-in-time check strongly mitigates the window for delivering events to revoked members, it cannot recall an already-authorized in-flight send or eliminate the theoretical query-to-TCP race.
+  - Final end-to-end resolution of this question will be complete in Milestone M8.4 when physical WebSocket connections, HTTP upgrade authentication, and protocol wire framing are integrated.

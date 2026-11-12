@@ -83,11 +83,23 @@ flowchart TD
 ### 2.5 Unified Project Event & Delivery Subsystem
 - **Single Canonical Table:** `project_events` acts simultaneously as the audit log, catch-up replay feed, and real-time notification source.
 - **No Outbox Table or Publication Flags:** The system maintains no per-event publication flags, no claim loops (`SKIP LOCKED`), and no separate outbox tables.
-- **Per-Instance Delivery Engine:**
-  - Maintains an in-memory delivery cursor (`local_last_delivered_seq`) per project for local connected sockets.
-  - Woken up by PostgreSQL `NOTIFY` signals carrying `(project_id, seq)`.
-  - Runs a fallback polling loop every 1 second querying active projects for sequences beyond the local cursor.
-  - Dispatches events to locally connected, authorized WebSockets in ascending sequence order.
+- **Per-Instance Delivery Engine (`DeliveryEngine`):**
+  - **In-Memory Per-Project State:** Maintains `ProjectDeliveryState` with an in-memory delivery cursor (`localLastDeliveredSeq`) and subscriber registry per active project for locally connected sockets. Projects with zero subscribers are automatically unloaded from memory.
+  - **Subscription Protocol C Handoff:**
+    - The initial subscriber for a project loads the authoritative `projects.last_seq` from PostgreSQL as the initial `localLastDeliveredSeq` and triggers an immediate catch-up drain to dispatch any events committed during registration.
+    - Subsequent subscribers register into the active project state and receive `currentSeq` from `projects.last_seq` in PostgreSQL. Clients use `currentSeq` to fetch missing events via `GET /api/projects/:projectId/changes?after=<snapshotSeq>` while buffering live events.
+  - **Single-Drain Lock & Coalescing:** Strictly one asynchronous drain loop (`activeDrain`) executes per project at any moment. Concurrent signals or drain requests coalesce by setting `pendingDrain = true`. When the active drain completes, if `pendingDrain` is set and the engine is running, another drain cycle executes immediately.
+  - **Pre-Dispatch PostgreSQL Authorization Gate:** Immediately prior to fan-out of each individual event (inside `dispatchSingleEvent`), the engine performs a fresh batched query against PostgreSQL `workspace_members` for all distinct subscriber user IDs.
+    - *Fail-Closed Safety:* If the database query encounters a transient error, event dispatch is halted and the cursor is frozen (`localLastDeliveredSeq` is not advanced), failing closed. While this fresh point-in-time check strongly mitigates the window for delivering events to revoked members, it cannot recall an already-authorized in-flight send or eliminate the theoretical query-to-TCP race.
+    - *Immediate Eviction:* Subscribers whose membership is confirmed absent in PostgreSQL are evicted and closed without receiving event data.
+  - **Concurrent Fan-Out with Bounded Send Timeout (Option A):**
+    - Events are fanned out concurrently to all eligible subscribers using `Promise.allSettled`, isolating synchronous throws and asynchronous rejections so one failing subscriber cannot delay or prevent delivery to others.
+    - A per-subscriber shutdown guard checks `isShuttingDown` immediately before each individual subscriber send; any send skipped due to shutdown is neither treated as an error nor evicted as a failure.
+    - Subscriber sends are bounded by a configurable timeout (default 5000 ms). If a subscriber rejects or times out, it is evicted and closed idempotently. Late promises are tracked so late resolution or rejection cannot mutate delivery state, advance cursors independently, or leak unhandled promise rejections.
+    - The project cursor `localLastDeliveredSeq` is advanced strictly after all send promises settle and the engine verifies it is not shutting down.
+  - **Single-Flight Polling Fallback:** A periodic background polling loop runs nominally every 1 second (configurable). A single-flight guard (`isPolling`) prevents overlapping polling sweeps. The loop iterates active projects with registered subscribers and triggers drain cycles, which query `project_events` for sequences beyond `localLastDeliveredSeq`. Missed NOTIFY signals are recovered on the next successful polling cycle, which runs nominally every second. Database or polling failures may delay recovery until a subsequent successful cycle.
+  - **Tenant-Scoped Revocation Eviction:** Subscribes to `MembershipConsumerService` domain events. Upon receiving a `revoked` event, immediately evicts all matching subscriber sockets across active projects in that workspace.
+  - **Graceful Shutdown Lifecycle:** Checks `isShuttingDown` at subscription entry, drain start, per-event batch processing, immediately before each individual subscriber's send, and prior to cursor advancement. When `stop()` is called, active drains are awaited up to `shutdownTimeoutMs`; if drains complete early, the shutdown timeout handle is cleared immediately via `try/finally` cleanup, and remaining subscribers are closed cleanly without orphan timers or background operations.
 
 ---
 
@@ -137,23 +149,43 @@ sequenceDiagram
     autonumber
     participant DB as PostgreSQL
     participant Listener as Dedicated LISTEN Connection
-    participant Delivery as Per-Instance Delivery Loop
-    participant WSManager as WebSocket Connection Manager
-    actor Client as Subscribed Client
+    participant Consumer as MembershipConsumerService
+    participant Delivery as DeliveryEngine (Per-Instance)
+    participant Sub as Local ProjectSubscriber (WS Socket)
+    actor Client as Browser Client
 
-    DB->>Listener: NOTIFY 'project_events' (projectId, seq) [Delivered after COMMIT]
-    Listener->>Delivery: Wake up for projectId
-    Delivery->>DB: SELECT * FROM project_events WHERE project_id = :id AND seq > :localCursor ORDER BY seq ASC
+    Note over DB,Delivery: Wake-up trigger path via LISTEN/NOTIFY
+    DB->>Listener: NOTIFY 'project_events' { projectId, seq } [Post-Commit]
+    Listener->>Delivery: Wake up for projectId (triggerDrain)
+
+    Note over Delivery,DB: Drain Loop (Coalesced & Single-Flight per project)
+    Delivery->>DB: SELECT * FROM project_events WHERE project_id = :id AND seq > :localCursor ORDER BY seq ASC LIMIT :batchSize
     DB-->>Delivery: Return committed event batch
+
     loop For each event in batch
-        Delivery->>DB: Verify subscriber membership & role against PostgreSQL
-        DB-->>Delivery: Membership active
-        Delivery->>WSManager: Dispatch event to local authorized sockets
-        WSManager->>Client: Send WebSocket message (seq, event_type, snapshot)
-        Delivery->>Delivery: Update localCursor = event.seq
+        Delivery->>DB: Pre-Dispatch Gate: SELECT userId, role FROM workspace_members WHERE workspaceId = :wsId AND userId IN (:distinctSubUserIds)
+        alt Transient DB Error
+            DB-->>Delivery: Query failure
+            Delivery->>Delivery: Halt batch & freeze cursor (fail-closed, no eviction)
+        else Confirmed Active Membership
+            DB-->>Delivery: Return active members
+            opt Subscriber Absent in DB
+                Delivery->>Sub: Evict & close unauthorized socket
+            end
+            Delivery->>Sub: Concurrent fan-out via Promise.allSettled (5s timeout)
+            Sub->>Client: Send WebSocket message (seq, eventType, payload)
+            Delivery->>Delivery: Settle all send promises & evict timed-out subscribers
+            Delivery->>Delivery: Advance localLastDeliveredSeq = event.seq
+        end
     end
 
-    Note over Delivery,DB: Fallback: Periodic Polling (every 1s)<br/>recovers missed NOTIFY signals
+    Note over Delivery,DB: Fallback: Single-Flight Polling (every 1s)<br/>discovers unnotified events & triggers drain
+    opt Membership Revocation Trigger
+        DB->>Listener: NOTIFY 'membership_changes' { workspaceId, userId }
+        Listener->>Consumer: Reconcile point-in-time membership
+        Consumer->>Delivery: emit('revoked', { workspaceId, userId })
+        Delivery->>Sub: Evict all matching subscriber sockets in workspace
+    end
 ```
 
 ---
